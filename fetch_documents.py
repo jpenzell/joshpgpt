@@ -48,42 +48,36 @@ def get_organization_id(access_token):
     }
     
     try:
-        # First try to get user info
+        # Get user info first
         user_response = requests.get('https://api.shoeboxed.com/v2/user', headers=headers)
+        print(f"User response status: {user_response.status_code}")
+        print(f"User response body: {user_response.text}")
+        
         if user_response.status_code == 200:
             user_data = user_response.json()
-            print(f"User data: {json.dumps(user_data, indent=2)}")
+            # Get the first account ID from the user's accounts
+            if 'accounts' in user_data and len(user_data['accounts']) > 0:
+                account_id = user_data['accounts'][0].get('id')
+                if account_id:
+                    print(f"Found account ID: {account_id}")
+                    return account_id
         
-        # Then get organizations
-        org_response = requests.get('https://api.shoeboxed.com/v2/organizations', headers=headers)
-        print(f"Organization response status: {org_response.status_code}")
-        print(f"Organization response body: {org_response.text}")
-        
-        if org_response.status_code == 200:
-            orgs = org_response.json()
-            if isinstance(orgs, list) and len(orgs) > 0:
-                return orgs[0].get('id')
-            elif isinstance(orgs, dict) and 'organizations' in orgs:
-                orgs_list = orgs['organizations']
-                if len(orgs_list) > 0:
-                    return orgs_list[0].get('id')
-        
-        raise Exception(f"No organization ID found. Response: {org_response.text}")
+        raise Exception(f"No account ID found in user data. User response: {user_response.text}")
         
     except Exception as e:
-        print(f"Error getting organization ID: {str(e)}")
+        print(f"Error getting account ID: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         raise
 
 def fetch_documents(access_token, modified_since=None):
     """Fetch documents from Shoeboxed API"""
-    # First get organization ID
-    print("Getting organization ID...")
-    org_id = get_organization_id(access_token)
-    print(f"Using organization ID: {org_id}")
+    # First get account ID
+    print("Getting account ID...")
+    account_id = get_organization_id(access_token)  # This now returns account_id
+    print(f"Using account ID: {account_id}")
     
     # Get list of documents
-    list_url = f"https://api.shoeboxed.com/v2/organizations/{org_id}/documents"
+    list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
     headers = {
         'Authorization': f'Bearer {access_token}',
         'Accept': 'application/json',
@@ -125,7 +119,7 @@ def fetch_documents(access_token, modified_since=None):
                 continue
                 
             print(f"Fetching details for document {doc_id}")
-            doc_url = f"https://api.shoeboxed.com/v2/organizations/{org_id}/documents/{doc_id}"
+            doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
             doc_response = requests.get(doc_url, headers=headers)
             
             if doc_response.status_code == 200:
