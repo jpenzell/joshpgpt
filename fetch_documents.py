@@ -69,12 +69,36 @@ def get_organization_id(access_token):
         print(f"Traceback: {traceback.format_exc()}")
         raise
 
+def load_progress():
+    """Load the current progress of document fetching"""
+    progress_file = 'fetch_progress.json'
+    try:
+        with open(progress_file, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {
+            'last_offset': 0,
+            'processed_document_ids': set(),
+            'total_documents_processed': 0
+        }
+
+def save_progress(progress):
+    """Save the current progress of document fetching"""
+    progress_file = 'fetch_progress.json'
+    # Convert set to list for JSON serialization
+    if isinstance(progress.get('processed_document_ids'), set):
+        progress['processed_document_ids'] = list(progress['processed_document_ids'])
+    
+    with open(progress_file, 'w') as f:
+        json.dump(progress, f, indent=2)
+
 def fetch_documents(access_token, modified_since=None):
-    """Fetch documents from Shoeboxed API"""
+    """Enhanced fetch_documents with resumability"""
     # First get account ID
-    print("Getting account ID...")
-    account_id = get_organization_id(access_token)  # This now returns account_id
-    print(f"Using account ID: {account_id}")
+    account_id = get_organization_id(access_token)
+    
+    # Load existing progress
+    progress = load_progress()
     
     # Get list of documents
     list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
@@ -89,24 +113,22 @@ def fetch_documents(access_token, modified_since=None):
     
     params = {
         'limit': 50,  # Number of documents per page
-        'offset': 0,
-        'include': 'attachments,metadata'  # Include all necessary data
+        'offset': progress.get('last_offset', 0),
+        'include': 'attachments,metadata'
     }
     
     if modified_since:
         params['modified_since'] = modified_since
     
     all_documents = []
+    processed_document_ids = set(progress.get('processed_document_ids', []))
     
-    # Get list of document IDs
     while True:
         print(f"Fetching document list with params: {params}")
         response = requests.get(list_url, headers=headers, params=params)
         
         if response.status_code != 200:
             print(f"Failed to fetch document list. Status: {response.status_code}")
-            print(f"Response headers: {dict(response.headers)}")
-            print(f"Response body: {response.text}")
             raise Exception(f"Failed to fetch document list: {response.text}")
         
         data = response.json()
@@ -115,7 +137,7 @@ def fetch_documents(access_token, modified_since=None):
         # Fetch each document's details
         for doc in doc_list:
             doc_id = doc.get('id')
-            if not doc_id:
+            if not doc_id or doc_id in processed_document_ids:
                 continue
                 
             print(f"Fetching details for document {doc_id}")
@@ -125,9 +147,17 @@ def fetch_documents(access_token, modified_since=None):
             if doc_response.status_code == 200:
                 doc_data = doc_response.json()
                 all_documents.append(doc_data)
+                processed_document_ids.add(doc_id)
+                
+                # Save progress after each document
+                progress = {
+                    'last_offset': params['offset'],
+                    'processed_document_ids': processed_document_ids,
+                    'total_documents_processed': len(processed_document_ids)
+                }
+                save_progress(progress)
             else:
                 print(f"Failed to fetch document {doc_id}. Status: {doc_response.status_code}")
-                print(f"Response: {doc_response.text}")
             
             time.sleep(0.5)  # Be nice to the API
         
@@ -141,7 +171,7 @@ def fetch_documents(access_token, modified_since=None):
     return all_documents
 
 def save_documents_and_images(documents, access_token):
-    """Save documents metadata and download their images"""
+    """Enhanced save method with progress tracking"""
     # Create base directories
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     base_dir = f'documents_{timestamp}'
@@ -155,9 +185,22 @@ def save_documents_and_images(documents, access_token):
     
     print(f"Saved metadata for {len(documents)} documents to {metadata_file}")
     
-    # Download images
+    # Download images with progress tracking
     total_images = 0
+    image_progress_file = f'{base_dir}/image_download_progress.json'
+    
+    # Load existing image download progress if it exists
+    try:
+        with open(image_progress_file, 'r') as f:
+            image_progress = json.load(f)
+    except FileNotFoundError:
+        image_progress = {'downloaded_doc_ids': []}
+    
     for doc in documents:
+        # Skip already downloaded images
+        if doc['id'] in image_progress.get('downloaded_doc_ids', []):
+            continue
+        
         if 'attachment' in doc:
             # Get the PDF version if available, otherwise get the original image
             image_url = doc['attachment'].get('pdf', doc['attachment'].get('original'))
@@ -168,6 +211,12 @@ def save_documents_and_images(documents, access_token):
                 print(f"Downloading image for document {doc['id']}...")
                 if download_image(image_url, access_token, image_filename):
                     total_images += 1
+                    image_progress['downloaded_doc_ids'].append(doc['id'])
+                    
+                    # Save image download progress after each successful download
+                    with open(image_progress_file, 'w') as f:
+                        json.dump(image_progress, f, indent=2)
+                    
                     print(f"Successfully downloaded image to {image_filename}")
                 else:
                     print(f"Failed to download image for document {doc['id']}")
