@@ -23,8 +23,8 @@ This application integrates with Shoeboxed's API to process documents and provid
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/shoeboxed-processor.git
-cd shoeboxed-processor
+git clone https://github.com/jpenzell/joshpgpt.git
+cd joshpgpt
 ```
 
 2. Create and activate a virtual environment:
