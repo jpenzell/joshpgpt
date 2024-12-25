@@ -193,26 +193,36 @@ def process_single_document(doc, documents_dir, index, state):
     """Process a single document and upload to Pinecone"""
     doc_id = doc['id']
     
+    # Enhanced logging
+    print(f"🔍 Processing document: {doc_id}")
+    print(f"Document Details:")
+    print(f"  - Created: {doc.get('created', 'N/A')}")
+    print(f"  - Category: {doc.get('category', 'Uncategorized')}")
+    print(f"  - Total: ${doc.get('total', 0.0)}")
+    
     # Check if already processed
     if doc_id in state.processed_docs:
-        print(f"Document {doc_id} already processed, skipping...")
+        print(f"⏩ Document {doc_id} already processed, skipping...")
         return True
     
     try:
         # Get document attachment
         attachment = doc.get('attachment', {})
         if not attachment:
-            print(f"No attachment found for document {doc_id}")
+            print(f"❌ No attachment found for document {doc_id}")
             return False
             
+        print(f"📥 Downloading document from: {attachment.get('url', 'Unknown URL')}")
+        
         # Download document
         headers = {'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY")}'}
         response = requests.get(attachment['url'], headers=headers)
         if response.status_code != 200:
-            print(f"Failed to download document: {response.status_code}")
+            print(f"❌ Failed to download document: HTTP {response.status_code}")
             return False
             
         # Upload to S3
+        print("☁️ Uploading document to S3...")
         s3_url = upload_to_s3(
             response.content,
             doc_id,
@@ -220,21 +230,29 @@ def process_single_document(doc, documents_dir, index, state):
         )
         
         if not s3_url:
-            print(f"Failed to upload document {doc_id} to S3")
+            print(f"❌ Failed to upload document {doc_id} to S3")
             return False
         
+        print(f"✅ Uploaded to S3: {s3_url}")
+        
         # Extract text using GPT-4 Vision
+        print("🔤 Extracting text with GPT-4 Vision...")
         text = extract_text_from_pdf(doc, os.getenv('OPENAI_API_KEY'))
         
         if not text:
-            print(f"No text could be extracted from document {doc_id}")
+            print(f"❌ No text could be extracted from document {doc_id}")
             return False
         
+        print(f"📝 Extracted text length: {len(text)} characters")
+        
         # Create embedding
+        print("🧩 Creating vector embedding...")
         embedding = create_embedding(text)
         if not embedding:
-            print(f"Failed to create embedding for document {doc_id}")
+            print(f"❌ Failed to create embedding for document {doc_id}")
             return False
+        
+        print(f"📊 Embedding vector length: {len(embedding)}")
         
         # Prepare metadata with S3 reference
         metadata = {
@@ -250,21 +268,23 @@ def process_single_document(doc, documents_dir, index, state):
         }
         
         # Upsert to Pinecone
-        index.upsert(
-            vectors=[{
-                'id': doc_id,
-                'values': embedding,
-                'metadata': metadata
-            }],
-            namespace=os.getenv('PINECONE_INDEX_NAME')
-        )
+        print("🔢 Upserting to Pinecone vector database...")
+        try:
+            index.upsert(vectors=[(str(doc_id), embedding, metadata)])
+            print(f"✅ Successfully processed and indexed document {doc_id}")
+        except Exception as e:
+            print(f"❌ Error upserting to Pinecone: {str(e)}")
+            return False
         
-        print(f"Successfully processed document {doc_id}")
+        # Mark as processed
         state.mark_processed(doc_id)
-        return True
+        state.save_progress()
         
+        print(f"🏁 Document {doc_id} processing complete!")
+        return True
+    
     except Exception as e:
-        print(f"Error processing document {doc_id}: {str(e)}")
+        print(f"❌ Unexpected error processing document {doc_id}: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         return False
 

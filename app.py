@@ -38,6 +38,28 @@ PINECONE_INDEX_HOST = os.getenv('PINECONE_INDEX_HOST')
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+def load_tokens():
+    """Load tokens from file"""
+    try:
+        with open('.auth_success', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise Exception("No tokens found. Please authenticate first.")
+
+def refresh_if_needed(tokens):
+    """Check if token needs refresh and refresh if necessary"""
+    try:
+        expires_at = datetime.fromisoformat(tokens.get('expires_at', datetime.now().isoformat()))
+        if datetime.now() >= expires_at:
+            # Implement token refresh logic here
+            # For now, we'll just re-authenticate
+            print("Token expired. Please re-authenticate.")
+            return tokens
+        return tokens
+    except Exception as e:
+        print(f"Error checking token expiration: {str(e)}")
+        return tokens
+
 def init_session_state():
     """Initialize session state variables"""
     # Initialize authentication state if not present
@@ -306,126 +328,160 @@ def handle_auth():
         st.session_state.authenticated = False
 
 def process_documents():
-    """Process documents from Shoeboxed"""
+    """Process documents from Shoeboxed in batches"""
     try:
-        # Initialize Pinecone
-        index = init_pinecone()
-        if not index:
-            st.error("Failed to initialize Pinecone")
-            return
+        # Load tokens
+        tokens = load_tokens()
         
-        # Get access token
-        if not os.path.exists('.auth_success'):
-            st.error("No authentication token found")
-            return
+        # Refresh token if needed
+        tokens = refresh_if_needed(tokens)
         
-        with open('.auth_success', 'r') as f:
-            auth_data = json.load(f)
-            access_token = auth_data.get('access_token')
-        
-        if not access_token:
-            st.error("No access token found")
-            return
-        
-        # Add status message
-        status_placeholder = st.empty()
-        status_placeholder.info("Fetching documents from Shoeboxed...")
-        
-        # Fetch documents
+        # Fetch document IDs first
+        print("🚀 Starting document ID retrieval...")
         try:
-            documents = fetch_documents(access_token)
-            if not documents:
-                st.error("No documents found")
-                return
-            status_placeholder.success(f"Found {len(documents)} documents")
-        except Exception as e:
-            st.error(f"Error fetching documents: {str(e)}")
-            print(f"Traceback: {traceback.format_exc()}")
+            account_id = get_organization_id(tokens['access_token'])
+            print(f"✅ Retrieved Account ID: {account_id}")
+        except Exception as account_error:
+            print(f"❌ Failed to retrieve account ID: {str(account_error)}")
+            st.error(f"Could not retrieve account ID: {str(account_error)}")
             return
         
-        # Load progress data
+        list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
+        headers = {
+            'Authorization': f'Bearer {tokens["access_token"]}',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        # Batch processing parameters
+        batch_size = 10
+        offset = 0
+        all_document_ids = []
+        
+        # Collect all document IDs
+        while True:
+            params = {
+                'limit': 50,  # Fetch 50 document IDs at a time
+                'offset': offset,
+                'include': 'metadata'
+            }
+            
+            print(f"📡 Fetching documents with params: {params}")
+            
+            try:
+                response = requests.get(list_url, headers=headers, params=params)
+                
+                print(f"📥 Response Status: {response.status_code}")
+                print(f"📥 Response Headers: {response.headers}")
+                
+                if response.status_code != 200:
+                    print(f"❌ Failed to fetch document list. Status: {response.status_code}")
+                    print(f"❌ Response Body: {response.text}")
+                    st.error(f"Failed to fetch documents. Status: {response.status_code}")
+                    break
+                
+                data = response.json()
+                doc_list = data.get('documents', [])
+                
+                print(f"📊 Documents in this batch: {len(doc_list)}")
+                
+                # Collect document IDs
+                batch_ids = [doc['id'] for doc in doc_list]
+                all_document_ids.extend(batch_ids)
+                
+                # Check if there are more documents
+                if len(doc_list) < params['limit']:
+                    break
+                
+                offset += params['limit']
+                
+            except requests.RequestException as req_error:
+                print(f"❌ Network error during document retrieval: {str(req_error)}")
+                st.error(f"Network error: {str(req_error)}")
+                break
+            except Exception as general_error:
+                print(f"❌ Unexpected error during document retrieval: {str(general_error)}")
+                st.error(f"Unexpected error: {str(general_error)}")
+                break
+        
+        print(f"📈 Total documents found: {len(all_document_ids)}")
+        
+        # Initialize Pinecone
+        print("🔢 Initializing Pinecone vector database...")
+        index = init_pinecone()
+        
+        # Initialize processing state
         state = ProcessingState()
         state.load_progress()
         
-        # Create progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        total_docs = len(documents)
-        processed_count = 0
+        # Create a timestamp-based directory for documents
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        documents_dir = f'documents_{timestamp}'
+        os.makedirs(documents_dir, exist_ok=True)
         
         # Process documents in batches
-        batch_size = 10
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
+        processed_count = 0
+        failed_count = 0
+        
+        for i in range(0, len(all_document_ids), batch_size):
+            # Get batch of document IDs
+            batch_ids = all_document_ids[i:i+batch_size]
+            batch_documents = []
             
-            for doc in batch:
-                doc_id = doc['id']
-                
-                # Skip if already processed
-                if state.is_processed(doc_id):
-                    processed_count += 1
-                    continue
-                
+            # Fetch details for each document in the batch
+            print(f"\n🔍 Fetching details for batch {i//batch_size + 1}")
+            for doc_id in batch_ids:
                 try:
-                    # Extract text
-                    text = extract_text_from_pdf(doc, access_token)
-                    if not text:
-                        print(f"No text extracted from document {doc_id}")
-                        continue
+                    doc_url = f"{list_url}/{doc_id}"
+                    doc_response = requests.get(doc_url, headers=headers)
                     
-                    # Create embedding
-                    embedding = create_embedding(text)
-                    if not embedding:
-                        print(f"Failed to create embedding for document {doc_id}")
-                        continue
+                    if doc_response.status_code == 200:
+                        doc_details = doc_response.json()
+                        batch_documents.append(doc_details)
+                        print(f"✅ Fetched details for document {doc_id}")
+                    else:
+                        print(f"❌ Failed to fetch details for document {doc_id}")
                     
-                    # Store in Pinecone
-                    metadata = {
-                        'text': text,
-                        'document_id': doc_id,
-                        'created': doc.get('created'),
-                        'modified': doc.get('modified'),
-                        'processed': doc.get('processed'),
-                        'attachment_type': doc.get('attachment', {}).get('type')
-                    }
+                    time.sleep(0.5)  # Be nice to the API
+                except Exception as e:
+                    print(f"❌ Error fetching document {doc_id}: {str(e)}")
+            
+            # Process this batch of documents
+            print(f"🔢 Processing batch of {len(batch_documents)} documents")
+            for doc in batch_documents:
+                try:
+                    # Process single document
+                    success = process_single_document(doc, documents_dir, index, state)
                     
-                    index.upsert(
-                        vectors=[{
-                            'id': doc_id,
-                            'values': embedding,
-                            'metadata': metadata
-                        }]
-                    )
+                    if success:
+                        processed_count += 1
+                    else:
+                        failed_count += 1
                     
-                    # Mark as processed
-                    state.mark_processed(doc_id)
-                    processed_count += 1
+                    # Optional: Add a small delay to prevent overwhelming the API
+                    time.sleep(0.5)
                     
                 except Exception as e:
-                    print(f"Error processing document {doc_id}: {str(e)}")
-                    continue
-                
-                # Update progress
-                progress = processed_count / total_docs
-                progress_bar.progress(progress)
-                status_text.text(f"Processed {processed_count} of {total_docs} documents")
-                
-                # Save progress periodically
-                if processed_count % 10 == 0:
-                    state.save_progress()
+                    print(f"❌ Error processing individual document: {str(e)}")
+                    failed_count += 1
+            
+            # Update Streamlit status
+            st.session_state.processing_status = f"Processed {processed_count} out of {len(all_document_ids)} documents"
         
-        # Final progress save
-        state.save_progress()
+        # Final summary
+        print("\n🏁 Document Processing Complete!")
+        print(f"📈 Total Documents: {len(all_document_ids)}")
+        print(f"✅ Successfully Processed: {processed_count}")
+        print(f"❌ Failed to Process: {failed_count}")
         
-        st.success(f"Successfully processed {processed_count} documents")
+        # Update session state
         st.session_state.processing_complete = True
+        st.session_state.processing_status = f"Processed {processed_count} out of {len(all_document_ids)} documents"
         
     except Exception as e:
-        error_message = f"Error processing documents: {str(e)}"
-        print(error_message)
+        print(f"❌ Critical error in document processing: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
-        st.error(error_message)
+        st.error(f"Document processing failed: {str(e)}")
 
 def chat_interface():
     """Chat interface for interacting with processed documents"""
@@ -625,6 +681,33 @@ def on_shutdown():
 # Register cleanup
 import atexit
 atexit.register(on_shutdown)
+
+# Add this helper function to get organization ID
+def get_organization_id(access_token):
+    """Get the organization ID for the authenticated user"""
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    try:
+        response = requests.get('https://api.shoeboxed.com/v2/user', headers=headers)
+        
+        if response.status_code == 200:
+            user_data = response.json()
+            # Get the first account ID from the user's accounts
+            if 'accounts' in user_data and len(user_data['accounts']) > 0:
+                account_id = user_data['accounts'][0].get('id')
+                if account_id:
+                    return account_id
+        
+        raise Exception(f"No account ID found in user data. User response: {response.text}")
+        
+    except Exception as e:
+        print(f"Error getting account ID: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise
 
 if __name__ == "__main__":
     main()
