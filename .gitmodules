@@ -1,0 +1,9 @@
+[submodule "openai-python"]
+	path = openai-python
+	url = https://github.com/openai/openai-python.git
+[submodule "pinecone-sdk"]
+	path = pinecone-sdk
+	url = https://github.com/pinecone-io/pinecone-python-client.git
+[submodule "shoeboxed-api"]
+	path = shoeboxed-api
+	url = https://github.com/Shoeboxed/api.git
