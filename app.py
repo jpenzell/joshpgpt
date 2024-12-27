@@ -21,6 +21,7 @@ from fetch_documents import fetch_documents
 from process_for_pinecone import extract_text_from_pdf, create_embedding, ProcessingState
 import logging
 import boto3
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -1004,6 +1005,74 @@ def generate_auth_url():
     }
     return AUTH_URL + '?' + urllib.parse.urlencode(params), state_token
 
+def reset_processing_state():
+    """Reset all processing state and clear databases"""
+    try:
+        print("\n🧹 Starting cleanup process...")
+        
+        # Clear Pinecone index
+        print("🔄 Clearing Pinecone index...")
+        index = init_pinecone()
+        if index:
+            index.delete(delete_all=True)
+            print("✅ Pinecone index cleared")
+        
+        # Delete local files
+        files_to_delete = [
+            'processing_checkpoint.json',
+            'document_id_cache.json'
+        ]
+        
+        for file in files_to_delete:
+            if os.path.exists(file):
+                os.remove(file)
+                print(f"✅ Deleted {file}")
+        
+        # Clear document directories
+        for dir_name in os.listdir('.'):
+            if dir_name.startswith('documents_'):
+                try:
+                    shutil.rmtree(dir_name)
+                    print(f"✅ Deleted directory {dir_name}")
+                except Exception as e:
+                    print(f"⚠️ Error deleting directory {dir_name}: {str(e)}")
+        
+        # Clear S3 bucket
+        try:
+            s3_client = boto3.client('s3')
+            bucket_name = os.environ.get('S3_BUCKET_NAME', 'shoeboxed-documents')
+            
+            print(f"🔄 Clearing S3 bucket {bucket_name}/processed_documents/...")
+            
+            # List and delete all objects in the processed_documents prefix
+            paginator = s3_client.get_paginator('list_objects_v2')
+            objects_to_delete = []
+            
+            for page in paginator.paginate(Bucket=bucket_name, Prefix='processed_documents/'):
+                if 'Contents' in page:
+                    objects_to_delete.extend(
+                        {'Key': obj['Key']} for obj in page['Contents']
+                    )
+            
+            if objects_to_delete:
+                s3_client.delete_objects(
+                    Bucket=bucket_name,
+                    Delete={'Objects': objects_to_delete}
+                )
+                print(f"✅ Deleted {len(objects_to_delete)} objects from S3")
+            else:
+                print("ℹ️ No objects found in S3 to delete")
+                
+        except Exception as e:
+            print(f"⚠️ Error clearing S3 bucket: {str(e)}")
+        
+        print("\n✅ Reset complete! The system is ready for fresh document processing.")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error during reset: {str(e)}")
+        return False
+
 def main():
     """Main application function"""
     st.title("Shoeboxed Document Processor")
@@ -1025,6 +1094,14 @@ def main():
             handle_auth()
     else:
         st.sidebar.success("Authenticated")
+        
+        # Add reset control at the top
+        if st.sidebar.button("🔄 Reset Processing"):
+            with st.spinner("Resetting all processing state..."):
+                if reset_processing_state():
+                    st.success("Reset complete! Ready for fresh document processing.")
+                else:
+                    st.error("Error during reset. Please check the logs.")
         
         # Add processing controls
         if st.sidebar.button("📄 Process Documents"):
