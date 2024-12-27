@@ -376,14 +376,13 @@ def handle_auth():
         st.error(error_message)
         st.session_state.authenticated = False
 
-def retrieve_all_document_ids(tokens):
+def retrieve_all_document_ids(tokens, checkpoint):
     """
     Retrieve all document IDs with robust, resumable mechanism
     
-    Supports:
-    - Resumable pagination
-    - Detailed filtering
-    - Comprehensive logging
+    Args:
+        tokens (dict): Authentication tokens
+        checkpoint (ProcessingCheckpoint): Checkpoint system for tracking progress
     """
     # Determine cache file path
     cache_file = 'document_id_cache.json'
@@ -392,131 +391,81 @@ def retrieve_all_document_ids(tokens):
     try:
         with open(cache_file, 'r') as f:
             cache_data = json.load(f)
-            last_offset = cache_data.get('last_offset', 0)
             cached_document_ids = cache_data.get('document_ids', [])
+            
+            # Filter out already processed documents
+            cached_document_ids = [
+                doc_id for doc_id in cached_document_ids 
+                if checkpoint.should_process_doc(doc_id)
+            ]
+            
+            print(f"📦 Loaded {len(cached_document_ids)} unprocessed documents from cache")
+            if cached_document_ids:
+                return cached_document_ids
     except FileNotFoundError:
-        last_offset = 0
-        cached_document_ids = []
+        print("No cache file found, starting fresh document retrieval")
     
-    # Get account ID
+    # If we get here, we need to fetch documents from the API
     account_id = get_organization_id(tokens['access_token'])
     list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
     
-    headers = {
-        'Authorization': f'Bearer {tokens["access_token"]}',
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    headers = get_shoeboxed_headers(tokens['access_token'])
     
     # Batch processing parameters
     batch_size = 100  # Maximum allowed by API
-    total_documents_retrieved = len(cached_document_ids)
-    
-    print(f"🔍 Resuming document ID retrieval from offset {last_offset}")
-    print(f"📦 Already cached: {total_documents_retrieved} document IDs")
+    last_offset = 0
+    all_document_ids = []
     
     try:
         while True:
-            # Enhanced query parameters
             params = {
                 'offset': last_offset,
                 'limit': batch_size,
-                'order_by_desc': 'uploaded',  # Sort by most recently uploaded first
-                'trashed': 'false'  # Only exclude trashed documents
+                'order_by_desc': 'uploaded',
+                'trashed': 'false'
             }
             
             print(f"📡 Fetching document batch starting at offset {last_offset}")
-            print(f"📋 Query Parameters: {params}")
             
             response = requests.get(list_url, headers=headers, params=params)
             
-            # Detailed logging of API response
-            print(f"🌐 Response Status: {response.status_code}")
-            print(f"🔑 Response Headers: {dict(response.headers)}")
-            
             if response.status_code != 200:
                 print(f"❌ Failed to fetch document list. Status: {response.status_code}")
-                print(f"Response Body: {response.text}")
                 break
             
-            # Parse response
             data = response.json()
-            
-            # Log total document count
-            total_count = data.get('totalCount', 0)
-            total_filtered_count = data.get('totalCountFiltered', 0)
-            print(f"📊 Total Documents: {total_count}")
-            print(f"🔍 Filtered Documents: {total_filtered_count}")
-            
-            # Extract document list
             doc_list = data.get('documents', [])
             
             if not doc_list:
-                print("🏁 No more documents to retrieve")
-                break  # No more documents
-            
-            # Extract and log document details
-            new_doc_ids = []
-            for doc in doc_list:
-                doc_id = doc.get('id')
-                doc_type = doc.get('type', 'Unknown')
-                doc_uploaded = doc.get('uploaded', 'Unknown')
-                doc_vendor = doc.get('vendor', 'N/A')
-                
-                print(f"📄 Document: {doc_id}")
-                print(f"   Type: {doc_type}")
-                print(f"   Uploaded: {doc_uploaded}")
-                print(f"   Vendor: {doc_vendor}")
-                
-                new_doc_ids.append(doc_id)
-            
-            # Add new document IDs
-            cached_document_ids.extend(new_doc_ids)
-            
-            # Update progress
-            total_documents_retrieved = len(cached_document_ids)
-            last_offset += batch_size
-            
-            # Save progress periodically
-            if total_documents_retrieved % (batch_size * 10) == 0:
-                with open(cache_file, 'w') as f:
-                    json.dump({
-                        'last_offset': last_offset,
-                        'document_ids': cached_document_ids,
-                        'timestamp': datetime.now().isoformat(),
-                        'total_count': total_count,
-                        'filtered_count': total_filtered_count
-                    }, f, indent=2)
-                
-                print(f"💾 Saved progress: {total_documents_retrieved} document IDs")
-            
-            # Optional: Add a small delay to be nice to the API
-            time.sleep(0.5)
-            
-            # Break if we've retrieved all documents
-            if last_offset >= total_count:
-                print("🏁 Retrieved all documents")
                 break
+            
+            # Filter documents that haven't been processed yet
+            new_doc_ids = [
+                doc.get('id') for doc in doc_list 
+                if doc.get('id') and checkpoint.should_process_doc(doc.get('id'))
+            ]
+            
+            all_document_ids.extend(new_doc_ids)
+            print(f"✅ Found {len(new_doc_ids)} unprocessed documents in this batch")
+            
+            last_offset += batch_size
+            if last_offset >= data.get('totalCount', 0):
+                break
+            
+            time.sleep(0.5)
     
     except Exception as e:
         print(f"❌ Error retrieving document IDs: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
     
-    finally:
-        # Final save of progress
-        with open(cache_file, 'w') as f:
-            json.dump({
-                'last_offset': last_offset,
-                'document_ids': cached_document_ids,
-                'timestamp': datetime.now().isoformat(),
-                'total_count': total_count,
-                'filtered_count': total_filtered_count
-            }, f, indent=2)
+    # Save to cache
+    with open(cache_file, 'w') as f:
+        json.dump({
+            'document_ids': all_document_ids,
+            'timestamp': datetime.now().isoformat()
+        }, f, indent=2)
     
-    print(f"🏁 Document ID Retrieval Complete")
-    print(f"📊 Total Documents Found: {total_documents_retrieved}")
-    
-    return cached_document_ids
+    print(f"📊 Total unprocessed documents found: {len(all_document_ids)}")
+    return all_document_ids
 
 def get_shoeboxed_headers(access_token=None):
     """Generate headers for Shoeboxed API requests"""
@@ -760,43 +709,46 @@ class ProcessingCheckpoint:
 def process_documents():
     """Process documents from Shoeboxed in batches"""
     try:
+        # Initialize checkpoint system first
+        checkpoint = ProcessingCheckpoint()
+        print("\n📋 Loading checkpoint...")
+        
         # Load tokens
         tokens = load_tokens()
-        
-        # Refresh token if needed
         tokens = refresh_if_needed(tokens)
         
         # Get organization ID
         account_id = get_organization_id(tokens['access_token'])
         
-        # Initialize checkpoint system
-        checkpoint = ProcessingCheckpoint()
-        
-        # Retrieve ALL document IDs (resumable)
-        all_document_ids = retrieve_all_document_ids(tokens)
+        # Retrieve only unprocessed document IDs
+        print("\n🔍 Retrieving unprocessed documents...")
+        all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
         
+        if total_documents == 0:
+            print("✅ No new documents to process!")
+            st.success("All documents have been processed!")
+            return
+        
+        print(f"\n📊 Found {total_documents} documents to process")
+        
         # Initialize Pinecone
-        print("🔢 Initializing Pinecone vector database...")
+        print("\n🔢 Initializing Pinecone vector database...")
         index = init_pinecone()
         
-        # Initialize processing state
-        state = ProcessingState()
-        state.load_progress()
-        
-        # Create a timestamp-based directory for documents
+        # Create documents directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         documents_dir = f'documents_{timestamp}'
         os.makedirs(documents_dir, exist_ok=True)
         
-        # Initialize progress metrics using checkpoint data
+        # Initialize progress metrics
         processed_count = len(checkpoint.processed_docs)
         failed_count = len(checkpoint.failed_docs)
         skipped_count = len(checkpoint.skipped_docs)
         batch_size = 10
         total_batches = (total_documents + batch_size - 1) // batch_size
         
-        # Create progress bar placeholder in Streamlit
+        # Create progress indicators
         progress_bar = st.progress(0)
         status_text = st.empty()
         metrics_cols = st.columns(4)
@@ -811,130 +763,106 @@ def process_documents():
         failed_metric.metric("Failed", failed_count)
         skipped_metric.metric("Skipped", skipped_count)
         
-        # Resume from last checkpoint
-        start_batch = checkpoint.current_batch
-        print(f"📋 Resuming from batch {start_batch}")
-        
-        for i in range(start_batch * batch_size, total_documents, batch_size):
-            # Get batch of document IDs
-            batch_ids = all_document_ids[i:i+batch_size]
-            batch_documents = []
-            current_batch = i//batch_size
+        # Process documents in batches
+        for batch_index in range(total_batches):
+            start_idx = batch_index * batch_size
+            end_idx = min(start_idx + batch_size, total_documents)
+            current_batch = all_document_ids[start_idx:end_idx]
             
-            # Update checkpoint with current batch
-            checkpoint.update_batch(current_batch)
-            
-            # Update progress
-            progress = i / total_documents
+            # Update progress display
+            progress = (batch_index + 1) / total_batches
             progress_bar.progress(progress)
-            status_text.text(f"Processing batch {current_batch + 1} of {total_batches} ({progress:.1%} complete)")
+            status_text.text(f"Processing batch {batch_index + 1} of {total_batches}")
             
-            # Fetch details for each document in the batch
-            print(f"\n🔍 Fetching details for batch {current_batch + 1}/{total_batches}")
-            for doc_id in batch_ids:
-                # Skip if document is already processed/failed/skipped
-                if not checkpoint.should_process_doc(doc_id):
-                    print(f"⏭️ Skipping already processed document {doc_id}")
-                    continue
-                
+            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
+            
+            # Process each document in the batch
+            for doc_id in current_batch:
                 try:
-                    # Construct the correct endpoint URL
+                    # Skip if already processed
+                    if not checkpoint.should_process_doc(doc_id):
+                        print(f"⏭️ Skipping already processed document {doc_id}")
+                        skipped_count += 1
+                        continue
+                    
+                    # Get document details
+                    print(f"\n📄 Processing document {doc_id}")
                     doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
+                    response = requests.get(doc_url, headers=get_shoeboxed_headers(tokens['access_token']))
                     
-                    # Prepare headers with proper authorization
-                    headers = get_shoeboxed_headers(tokens['access_token'])
-                    
-                    # Make the API request
-                    doc_response = requests.get(doc_url, headers=headers)
-                    
-                    # Log detailed response information
-                    print(f"📄 Document {doc_id} Retrieval:")
-                    print(f"  Status Code: {doc_response.status_code}")
-                    
-                    # Check response status
-                    if doc_response.status_code == 200:
-                        doc_details = doc_response.json()
-                        
-                        # Additional logging for document details
-                        print(f"  Document Type: {doc_details.get('type', 'Unknown')}")
-                        print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}")
-                        print(f"  Uploaded: {doc_details.get('uploaded', 'Unknown')}")
-                        
-                        # Only add documents that are fully processed
-                        if doc_details.get('processingState') == 'PROCESSED':
-                            batch_documents.append(doc_details)
-                            print(f"✅ Successfully fetched details for document {doc_id}")
-                        else:
-                            print(f"⚠️ Skipping document {doc_id} - Processing State: {doc_details.get('processingState')}")
-                            skipped_count += 1
-                    else:
-                        print(f"❌ Failed to fetch details for document {doc_id}")
+                    if response.status_code != 200:
+                        print(f"❌ Failed to get document details. Status: {response.status_code}")
+                        checkpoint.mark_failed(doc_id)
                         failed_count += 1
+                        continue
                     
-                    # Be nice to the API
-                    time.sleep(0.5)
+                    doc_data = response.json()
                     
-                except Exception as e:
-                    print(f"❌ Critical error fetching document {doc_id}: {str(e)}")
-                    failed_count += 1
-            
-            # Process this batch of documents
-            print(f"🔢 Processing batch of {len(batch_documents)} documents")
-            for doc in batch_documents:
-                try:
-                    # Process single document
-                    success = process_single_document(doc, tokens, state)
-                    
-                    if success:
-                        checkpoint.mark_processed(doc['id'])
-                        processed_count += 1
-                    else:
-                        checkpoint.mark_failed(doc['id'])
+                    # Download and process the document
+                    pdf_data = download_document(doc_data, tokens['access_token'])
+                    if pdf_data is None:
+                        print("❌ Failed to download document")
+                        checkpoint.mark_failed(doc_id)
                         failed_count += 1
+                        continue
                     
-                    # Update metrics
+                    # Extract text from PDF
+                    extracted_text = extract_text_with_gpt4o(pdf_data)
+                    if not extracted_text:
+                        print("❌ Failed to extract text")
+                        checkpoint.mark_failed(doc_id)
+                        failed_count += 1
+                        continue
+                    
+                    # Create document metadata
+                    metadata = create_document_metadata(doc_data, extracted_text)
+                    
+                    # Generate embeddings and store in Pinecone
+                    store_in_pinecone(index, doc_id, extracted_text, metadata)
+                    
+                    # Mark as processed and update counts
+                    checkpoint.mark_processed(doc_id)
+                    processed_count += 1
+                    
+                    # Update metrics display
+                    total_metric.metric("Total Documents", total_documents)
                     processed_metric.metric("Processed", processed_count)
                     failed_metric.metric("Failed", failed_count)
                     skipped_metric.metric("Skipped", skipped_count)
                     
-                    # Optional: Add a small delay to prevent overwhelming the API
-                    time.sleep(0.5)
+                    # Save progress after each document
+                    checkpoint.save()
                     
                 except Exception as e:
-                    print(f"❌ Error processing individual document: {str(e)}")
+                    print(f"❌ Error processing document {doc_id}: {str(e)}")
+                    checkpoint.mark_failed(doc_id)
                     failed_count += 1
+                    checkpoint.save()
             
-            # Update metrics
-            processed_metric.metric("Processed", processed_count)
-            failed_metric.metric("Failed", failed_count)
-            skipped_metric.metric("Skipped", skipped_count)
-            
-            # Save checkpoint after each batch
-            checkpoint.save_checkpoint()
+            # Refresh token if needed after each batch
+            tokens = refresh_if_needed(tokens)
         
         # Final progress update
         progress_bar.progress(1.0)
         status_text.text("Processing complete!")
         
-        # Final summary
-        print("\n🏁 Document Processing Complete!")
-        print(f"📈 Total Documents: {total_documents}")
-        print(f"✅ Successfully Processed: {processed_count}")
-        print(f"❌ Failed to Process: {failed_count}")
-        print(f"⚠️ Skipped: {skipped_count}")
+        # Display final metrics
+        total_metric.metric("Total Documents", total_documents)
+        processed_metric.metric("Processed", processed_count)
+        failed_metric.metric("Failed", failed_count)
+        skipped_metric.metric("Skipped", skipped_count)
         
-        # Update session state
-        st.session_state.processing_complete = True
-        st.session_state.processing_status = (
-            f"Complete! Processed: {processed_count} | "
-            f"Failed: {failed_count} | "
-            f"Skipped: {skipped_count}"
-        )
+        print("\n✅ Document processing complete!")
+        print(f"📊 Final Statistics:")
+        print(f"   Total Documents: {total_documents}")
+        print(f"   Processed: {processed_count}")
+        print(f"   Failed: {failed_count}")
+        print(f"   Skipped: {skipped_count}")
         
     except Exception as e:
-        print(f"❌ Critical error in document processing: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        st.error(f"Document processing failed: {str(e)}")
+        print(f"❌ Error in document processing: {str(e)}")
+        st.error(f"An error occurred during processing: {str(e)}")
+        raise
 
 def chat_interface():
     """Chat interface for interacting with processed documents"""
