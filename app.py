@@ -389,15 +389,24 @@ def retrieve_all_document_ids(tokens, checkpoint):
     cache_file = 'document_id_cache.json'
     metadata_file = 'retrieval_metadata.json'
     
+    print("\n📋 Document Processing Status:")
+    print("--------------------------------")
+    print(f"✅ Fully Processed (in Pinecone): {len(checkpoint.processed_docs)}")
+    print(f"❌ Failed Documents: {len(checkpoint.failed_docs)}")
+    print(f"⏭️ Skipped Documents: {len(checkpoint.skipped_docs)}")
+    
     # Load or initialize retrieval metadata
     try:
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
             last_successful_date = metadata.get('last_successful_date')
             last_offset = metadata.get('last_offset', 0)
+            print(f"📅 Last Successful Date: {last_successful_date}")
+            print(f"📍 Last Offset: {last_offset}")
     except FileNotFoundError:
         last_successful_date = None
         last_offset = 0
+        print("🆕 Starting fresh document retrieval")
     
     # Try to load existing document cache
     try:
@@ -405,13 +414,13 @@ def retrieve_all_document_ids(tokens, checkpoint):
             cache_data = json.load(f)
             cached_document_ids = cache_data.get('document_ids', [])
             
-            # Filter out already processed documents
+            # Filter out documents that have been fully processed (in Pinecone)
             cached_document_ids = [
                 doc_id for doc_id in cached_document_ids 
                 if checkpoint.should_process_doc(doc_id)
             ]
             
-            print(f"📦 Loaded {len(cached_document_ids)} unprocessed documents from cache")
+            print(f"📦 Loaded {len(cached_document_ids)} documents from cache that need processing")
     except FileNotFoundError:
         print("No cache file found, starting fresh document retrieval")
         cached_document_ids = []
@@ -440,7 +449,7 @@ def retrieve_all_document_ids(tokens, checkpoint):
             if last_successful_date:
                 params['modified_since'] = last_successful_date
             
-            print(f"📡 Fetching document batch starting at offset {current_offset}")
+            print(f"\n📡 Fetching document batch starting at offset {current_offset}")
             if last_successful_date:
                 print(f"   Filtering for documents modified since {last_successful_date}")
             
@@ -458,15 +467,30 @@ def retrieve_all_document_ids(tokens, checkpoint):
             
             # Process and filter documents
             new_docs = []
+            shoeboxed_processed = 0
+            shoeboxed_needs_processing = 0
+            shoeboxed_other_state = 0
+            
             for doc in doc_list:
                 doc_id = doc.get('id')
                 if not doc_id:
                     continue
-                    
-                # Skip if already processed
+                
+                # Track Shoeboxed processing state
+                processing_state = doc.get('processingState')
+                if processing_state == 'PROCESSED':
+                    shoeboxed_processed += 1
+                elif processing_state == 'NEEDS_USER_PROCESSING':
+                    shoeboxed_needs_processing += 1
+                else:
+                    shoeboxed_other_state += 1
+                    print(f"⚠️ Document {doc_id} in state: {processing_state}")
+                    continue
+                
+                # Skip if already fully processed in our system
                 if not checkpoint.should_process_doc(doc_id):
                     continue
-                    
+                
                 # Track the latest modification date
                 modified_date = doc.get('modified')
                 if modified_date:
@@ -475,9 +499,15 @@ def retrieve_all_document_ids(tokens, checkpoint):
                 
                 new_docs.append(doc_id)
             
+            # Log batch statistics
+            print(f"\n📊 Batch Statistics:")
+            print(f"   Shoeboxed Processed: {shoeboxed_processed}")
+            print(f"   Needs Processing: {shoeboxed_needs_processing}")
+            print(f"   Other States: {shoeboxed_other_state}")
+            print(f"   New Documents to Process: {len(new_docs)}")
+            
             # Update progress
             all_document_ids.extend(new_docs)
-            print(f"✅ Found {len(new_docs)} new unprocessed documents in this batch")
             
             # Save progress periodically
             if len(new_docs) > 0:
@@ -523,7 +553,13 @@ def retrieve_all_document_ids(tokens, checkpoint):
                     'error': str(e)
                 }, f, indent=2)
     
-    print(f"📊 Total unprocessed documents found: {len(all_document_ids)}")
+    print(f"\n📊 Final Statistics:")
+    print(f"   Total Documents Found: {len(all_document_ids)}")
+    print(f"   Already in Pinecone: {len(checkpoint.processed_docs)}")
+    print(f"   Failed Previously: {len(checkpoint.failed_docs)}")
+    print(f"   Skipped: {len(checkpoint.skipped_docs)}")
+    print(f"   To Be Processed: {len(all_document_ids)}")
+    
     return all_document_ids
 
 def get_shoeboxed_headers(access_token=None):
