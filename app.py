@@ -385,6 +385,10 @@ def retrieve_all_document_ids(tokens, checkpoint):
         tokens (dict): Authentication tokens
         checkpoint (ProcessingCheckpoint): Checkpoint system for tracking progress
     """
+    # Create a Streamlit placeholder for the running count
+    running_count = st.empty()
+    total_to_process = 0
+    
     # Determine cache file path and metadata file path
     cache_file = 'document_id_cache.json'
     metadata_file = 'retrieval_metadata.json'
@@ -401,8 +405,13 @@ def retrieve_all_document_ids(tokens, checkpoint):
             metadata = json.load(f)
             last_successful_date = metadata.get('last_successful_date')
             last_offset = metadata.get('last_offset', 0)
+            total_to_process = metadata.get('total_to_process', 0)
             print(f"📅 Last Successful Date: {last_successful_date}")
             print(f"📍 Last Offset: {last_offset}")
+            print(f"📊 Previously Found To Process: {total_to_process}")
+            
+            # Update the running count display
+            running_count.metric("Documents To Process", total_to_process)
     except FileNotFoundError:
         last_successful_date = None
         last_offset = 0
@@ -421,6 +430,8 @@ def retrieve_all_document_ids(tokens, checkpoint):
             ]
             
             print(f"📦 Loaded {len(cached_document_ids)} documents from cache that need processing")
+            total_to_process = len(cached_document_ids)
+            running_count.metric("Documents To Process", total_to_process)
     except FileNotFoundError:
         print("No cache file found, starting fresh document retrieval")
         cached_document_ids = []
@@ -467,29 +478,23 @@ def retrieve_all_document_ids(tokens, checkpoint):
             
             # Process and filter documents
             new_docs = []
-            shoeboxed_processed = 0
-            shoeboxed_needs_processing = 0
-            shoeboxed_other_state = 0
+            batch_stats = {
+                'total': 0,
+                'to_process': 0
+            }
             
             for doc in doc_list:
                 doc_id = doc.get('id')
                 if not doc_id:
                     continue
                 
-                # Track Shoeboxed processing state
-                processing_state = doc.get('processingState')
-                if processing_state == 'PROCESSED':
-                    shoeboxed_processed += 1
-                elif processing_state == 'NEEDS_USER_PROCESSING':
-                    shoeboxed_needs_processing += 1
-                else:
-                    shoeboxed_other_state += 1
-                    print(f"⚠️ Document {doc_id} in state: {processing_state}")
-                    continue
+                batch_stats['total'] += 1
                 
                 # Skip if already fully processed in our system
                 if not checkpoint.should_process_doc(doc_id):
                     continue
+                
+                batch_stats['to_process'] += 1
                 
                 # Track the latest modification date
                 modified_date = doc.get('modified')
@@ -499,12 +504,15 @@ def retrieve_all_document_ids(tokens, checkpoint):
                 
                 new_docs.append(doc_id)
             
+            # Update total count and display
+            total_to_process += batch_stats['to_process']
+            running_count.metric("Documents To Process", total_to_process)
+            
             # Log batch statistics
             print(f"\n📊 Batch Statistics:")
-            print(f"   Shoeboxed Processed: {shoeboxed_processed}")
-            print(f"   Needs Processing: {shoeboxed_needs_processing}")
-            print(f"   Other States: {shoeboxed_other_state}")
-            print(f"   New Documents to Process: {len(new_docs)}")
+            print(f"   Total Documents: {batch_stats['total']}")
+            print(f"   To Process: {batch_stats['to_process']}")
+            print(f"   Running Total To Process: {total_to_process}")
             
             # Update progress
             all_document_ids.extend(new_docs)
@@ -524,6 +532,7 @@ def retrieve_all_document_ids(tokens, checkpoint):
                         'last_successful_date': last_successful_date,
                         'last_offset': current_offset,
                         'total_documents': len(all_document_ids),
+                        'total_to_process': total_to_process,
                         'last_update': datetime.now().isoformat()
                     }, f, indent=2)
             
@@ -549,6 +558,7 @@ def retrieve_all_document_ids(tokens, checkpoint):
                     'last_successful_date': last_successful_date,
                     'last_offset': current_offset,
                     'total_documents': len(all_document_ids),
+                    'total_to_process': total_to_process,
                     'last_update': datetime.now().isoformat(),
                     'error': str(e)
                 }, f, indent=2)
@@ -558,7 +568,7 @@ def retrieve_all_document_ids(tokens, checkpoint):
     print(f"   Already in Pinecone: {len(checkpoint.processed_docs)}")
     print(f"   Failed Previously: {len(checkpoint.failed_docs)}")
     print(f"   Skipped: {len(checkpoint.skipped_docs)}")
-    print(f"   To Be Processed: {len(all_document_ids)}")
+    print(f"   To Be Processed: {total_to_process}")
     
     return all_document_ids
 
@@ -643,7 +653,7 @@ def download_document(doc_details, tokens):
 
 def process_single_document(doc_details, tokens, state):
     """
-    Enhanced document processing with robust error handling and detailed logging
+    Process a single document regardless of its Shoeboxed processing state
     """
     try:
         doc_id = doc_details.get('id')
@@ -652,9 +662,9 @@ def process_single_document(doc_details, tokens, state):
         print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}")
         print(f"  Upload Date: {doc_details.get('uploaded')}")
         
-        # Skip if document is already processed
+        # Skip if document is already processed in our system
         if state.is_document_processed(doc_id):
-            print(f"⏭️  Document {doc_id} already processed. Skipping.")
+            print(f"⏭️  Document {doc_id} already processed in our system. Skipping.")
             return False
         
         # Download document
