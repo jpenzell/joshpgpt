@@ -687,6 +687,76 @@ def process_single_document(doc_details, tokens, state):
         print(f"Traceback: {traceback.format_exc()}")
         return False
 
+class ProcessingCheckpoint:
+    def __init__(self):
+        self.checkpoint_file = 'processing_checkpoint.json'
+        self.current_batch = 0
+        self.processed_docs = set()
+        self.failed_docs = set()
+        self.skipped_docs = set()
+        self.last_processed_time = None
+        self.load_checkpoint()
+    
+    def load_checkpoint(self):
+        """Load the last checkpoint if it exists"""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                with open(self.checkpoint_file, 'r') as f:
+                    data = json.load(f)
+                    self.current_batch = data.get('current_batch', 0)
+                    self.processed_docs = set(data.get('processed_docs', []))
+                    self.failed_docs = set(data.get('failed_docs', []))
+                    self.skipped_docs = set(data.get('skipped_docs', []))
+                    self.last_processed_time = data.get('last_processed_time')
+                print(f"📥 Loaded checkpoint: Batch {self.current_batch}")
+                print(f"✅ Processed: {len(self.processed_docs)} documents")
+                print(f"❌ Failed: {len(self.failed_docs)} documents")
+                print(f"⏭️ Skipped: {len(self.skipped_docs)} documents")
+        except Exception as e:
+            print(f"⚠️ Error loading checkpoint: {str(e)}")
+    
+    def save_checkpoint(self):
+        """Save current progress to checkpoint file"""
+        try:
+            data = {
+                'current_batch': self.current_batch,
+                'processed_docs': list(self.processed_docs),
+                'failed_docs': list(self.failed_docs),
+                'skipped_docs': list(self.skipped_docs),
+                'last_processed_time': datetime.now().isoformat()
+            }
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"💾 Saved checkpoint at batch {self.current_batch}")
+        except Exception as e:
+            print(f"⚠️ Error saving checkpoint: {str(e)}")
+    
+    def mark_processed(self, doc_id):
+        """Mark a document as processed"""
+        self.processed_docs.add(doc_id)
+        self.save_checkpoint()
+    
+    def mark_failed(self, doc_id):
+        """Mark a document as failed"""
+        self.failed_docs.add(doc_id)
+        self.save_checkpoint()
+    
+    def mark_skipped(self, doc_id):
+        """Mark a document as skipped"""
+        self.skipped_docs.add(doc_id)
+        self.save_checkpoint()
+    
+    def update_batch(self, batch_num):
+        """Update current batch number"""
+        self.current_batch = batch_num
+        self.save_checkpoint()
+    
+    def should_process_doc(self, doc_id):
+        """Check if document should be processed"""
+        return doc_id not in self.processed_docs and \
+               doc_id not in self.failed_docs and \
+               doc_id not in self.skipped_docs
+
 def process_documents():
     """Process documents from Shoeboxed in batches"""
     try:
@@ -698,6 +768,9 @@ def process_documents():
         
         # Get organization ID
         account_id = get_organization_id(tokens['access_token'])
+        
+        # Initialize checkpoint system
+        checkpoint = ProcessingCheckpoint()
         
         # Retrieve ALL document IDs (resumable)
         all_document_ids = retrieve_all_document_ids(tokens)
@@ -716,10 +789,10 @@ def process_documents():
         documents_dir = f'documents_{timestamp}'
         os.makedirs(documents_dir, exist_ok=True)
         
-        # Initialize progress metrics
-        processed_count = 0
-        failed_count = 0
-        skipped_count = 0
+        # Initialize progress metrics using checkpoint data
+        processed_count = len(checkpoint.processed_docs)
+        failed_count = len(checkpoint.failed_docs)
+        skipped_count = len(checkpoint.skipped_docs)
         batch_size = 10
         total_batches = (total_documents + batch_size - 1) // batch_size
         
@@ -738,20 +811,32 @@ def process_documents():
         failed_metric.metric("Failed", failed_count)
         skipped_metric.metric("Skipped", skipped_count)
         
-        for i in range(0, total_documents, batch_size):
+        # Resume from last checkpoint
+        start_batch = checkpoint.current_batch
+        print(f"📋 Resuming from batch {start_batch}")
+        
+        for i in range(start_batch * batch_size, total_documents, batch_size):
             # Get batch of document IDs
             batch_ids = all_document_ids[i:i+batch_size]
             batch_documents = []
-            current_batch = i//batch_size + 1
+            current_batch = i//batch_size
+            
+            # Update checkpoint with current batch
+            checkpoint.update_batch(current_batch)
             
             # Update progress
             progress = i / total_documents
             progress_bar.progress(progress)
-            status_text.text(f"Processing batch {current_batch} of {total_batches} ({progress:.1%} complete)")
+            status_text.text(f"Processing batch {current_batch + 1} of {total_batches} ({progress:.1%} complete)")
             
             # Fetch details for each document in the batch
-            print(f"\n🔍 Fetching details for batch {current_batch}/{total_batches}")
+            print(f"\n🔍 Fetching details for batch {current_batch + 1}/{total_batches}")
             for doc_id in batch_ids:
+                # Skip if document is already processed/failed/skipped
+                if not checkpoint.should_process_doc(doc_id):
+                    print(f"⏭️ Skipping already processed document {doc_id}")
+                    continue
+                
                 try:
                     # Construct the correct endpoint URL
                     doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
@@ -801,8 +886,10 @@ def process_documents():
                     success = process_single_document(doc, tokens, state)
                     
                     if success:
+                        checkpoint.mark_processed(doc['id'])
                         processed_count += 1
                     else:
+                        checkpoint.mark_failed(doc['id'])
                         failed_count += 1
                     
                     # Update metrics
@@ -817,14 +904,13 @@ def process_documents():
                     print(f"❌ Error processing individual document: {str(e)}")
                     failed_count += 1
             
-            # Update progress message
-            status_message = (
-                f"Processed: {processed_count} | "
-                f"Failed: {failed_count} | "
-                f"Skipped: {skipped_count} | "
-                f"Progress: {progress:.1%}"
-            )
-            st.session_state.processing_status = status_message
+            # Update metrics
+            processed_metric.metric("Processed", processed_count)
+            failed_metric.metric("Failed", failed_count)
+            skipped_metric.metric("Skipped", skipped_count)
+            
+            # Save checkpoint after each batch
+            checkpoint.save_checkpoint()
         
         # Final progress update
         progress_bar.progress(1.0)
