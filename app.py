@@ -421,9 +421,8 @@ def retrieve_all_document_ids(tokens):
             params = {
                 'offset': last_offset,
                 'limit': batch_size,
-                'processing_state': 'PROCESSED',  # Only fetch fully processed documents
                 'order_by_desc': 'uploaded',  # Sort by most recently uploaded first
-                'trashed': 'false'  # Exclude trashed documents
+                'trashed': 'false'  # Only exclude trashed documents
             }
             
             print(f"📡 Fetching document batch starting at offset {last_offset}")
@@ -600,82 +599,92 @@ def download_document(doc_details, tokens):
 
 def process_single_document(doc_details, tokens, state):
     """
-    Enhanced document processing with robust error handling
-    
-    Args:
-        doc_details (dict): Document details from Shoeboxed
-        tokens (dict): Authentication tokens
-        state (ProcessingState): Processing state tracking object
-    
-    Returns:
-        bool: Whether document processing was successful
+    Enhanced document processing with robust error handling and detailed logging
     """
     try:
         doc_id = doc_details.get('id')
+        print(f"\n📄 Processing document {doc_id}:")
+        print(f"  Type: {doc_details.get('type')}")
+        print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}")
+        print(f"  Upload Date: {doc_details.get('uploaded')}")
         
         # Skip if document is already processed
         if state.is_document_processed(doc_id):
-            logging.info(f"Document {doc_id} already processed. Skipping.")
-            return False
-        
-        # Validate document details
-        if not doc_id:
-            logging.error("Invalid document: Missing document ID")
+            print(f"⏭️  Document {doc_id} already processed. Skipping.")
             return False
         
         # Download document
+        print(f"📥 Downloading document...")
         document_content = download_document(doc_details, tokens)
         if not document_content:
-            logging.error(f"Failed to download document {doc_id}")
+            print(f"❌ Failed to download document {doc_id}")
             return False
-        
-        # Create local directory for documents
-        os.makedirs('documents', exist_ok=True)
-        local_file_path = os.path.join('documents', f"{doc_id}.pdf")
+        print(f"✅ Downloaded document: {len(document_content)} bytes")
         
         # Save document locally
+        os.makedirs('documents', exist_ok=True)
+        local_file_path = os.path.join('documents', f"{doc_id}.pdf")
         with open(local_file_path, 'wb') as f:
             f.write(document_content)
+        print(f"💾 Saved document locally: {local_file_path}")
         
-        # Extract text using GPT-4o (pass the bytes directly)
+        # Extract text using GPT-4V
+        print(f"🔍 Extracting text using {os.getenv('OPENAI_VISION_MODEL', 'gpt-4-vision-preview')}...")
         extracted_text = extract_text_with_gpt4o(document_content)
         if not extracted_text:
-            logging.error(f"Failed to extract text from document {doc_id}")
+            print(f"❌ Failed to extract text from document {doc_id}")
             return False
+        print(f"✅ Successfully extracted text ({len(extracted_text)} characters)")
         
         # Create embedding
+        print(f"🧮 Creating embedding...")
         text_embedding = create_embedding(extracted_text)
         if not text_embedding:
-            logging.error(f"Failed to create embedding for document {doc_id}")
+            print(f"❌ Failed to create embedding for document {doc_id}")
             return False
+        print(f"✅ Created embedding vector")
+        
+        # Upload to S3
+        print(f"☁️  Uploading to S3...")
+        s3_url = upload_to_s3(local_file_path, doc_id)
+        if not s3_url:
+            print(f"❌ Failed to upload document {doc_id} to S3")
+            return False
+        print(f"✅ Uploaded to S3: {s3_url}")
         
         # Prepare metadata
         metadata = {
             'document_id': doc_id,
             'type': doc_details.get('type', 'unknown'),
-            'vendor': doc_details.get('vendor', 'unknown'),
-            'total': doc_details.get('total', 0),
-            'uploaded_date': doc_details.get('uploaded', ''),
-            'categories': doc_details.get('categories', []),
-            'text': extracted_text[:4000]  # Truncate for storage
+            'vendor': doc_details.get('vendor') or 'unknown',
+            'total': float(doc_details.get('total', 0) or 0),
+            'uploaded_date': doc_details.get('uploaded', '') or '',
+            'categories': doc_details.get('categories', []) or [],
+            'text': (extracted_text[:4000] if extracted_text else '') or '',
+            's3_url': s3_url
         }
         
-        # Upload to S3
-        s3_url = upload_to_s3(local_file_path, doc_id)
-        if s3_url:
-            metadata['s3_url'] = s3_url
+        # Remove any remaining null values from metadata
+        metadata = {k: v for k, v in metadata.items() if v is not None}
+        
+        # Log metadata before upsert
+        print(f"📝 Prepared metadata:")
+        print(json.dumps(metadata, indent=2))
         
         # Upsert to Pinecone
+        print(f"📤 Upserting to Pinecone...")
         upsert_to_pinecone(doc_id, text_embedding, metadata)
+        print(f"✅ Successfully upserted to Pinecone")
         
         # Mark document as processed
         state.mark_processed(doc_id)
+        print(f"✅ Document {doc_id} fully processed")
         
         return True
     
     except Exception as e:
-        logging.error(f"Error processing document {doc_id}: {str(e)}")
-        logging.error(f"Traceback: {traceback.format_exc()}")
+        print(f"❌ Error processing document {doc_id}: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return False
 
 def process_documents():
@@ -692,6 +701,7 @@ def process_documents():
         
         # Retrieve ALL document IDs (resumable)
         all_document_ids = retrieve_all_document_ids(tokens)
+        total_documents = len(all_document_ids)
         
         # Initialize Pinecone
         print("🔢 Initializing Pinecone vector database...")
@@ -706,18 +716,41 @@ def process_documents():
         documents_dir = f'documents_{timestamp}'
         os.makedirs(documents_dir, exist_ok=True)
         
-        # Process documents in batches
+        # Initialize progress metrics
         processed_count = 0
         failed_count = 0
+        skipped_count = 0
         batch_size = 10
+        total_batches = (total_documents + batch_size - 1) // batch_size
         
-        for i in range(0, len(all_document_ids), batch_size):
+        # Create progress bar placeholder in Streamlit
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        metrics_cols = st.columns(4)
+        total_metric = metrics_cols[0].empty()
+        processed_metric = metrics_cols[1].empty()
+        failed_metric = metrics_cols[2].empty()
+        skipped_metric = metrics_cols[3].empty()
+        
+        # Update initial metrics
+        total_metric.metric("Total Documents", total_documents)
+        processed_metric.metric("Processed", processed_count)
+        failed_metric.metric("Failed", failed_count)
+        skipped_metric.metric("Skipped", skipped_count)
+        
+        for i in range(0, total_documents, batch_size):
             # Get batch of document IDs
             batch_ids = all_document_ids[i:i+batch_size]
             batch_documents = []
+            current_batch = i//batch_size + 1
+            
+            # Update progress
+            progress = i / total_documents
+            progress_bar.progress(progress)
+            status_text.text(f"Processing batch {current_batch} of {total_batches} ({progress:.1%} complete)")
             
             # Fetch details for each document in the batch
-            print(f"\n🔍 Fetching details for batch {i//batch_size + 1}")
+            print(f"\n🔍 Fetching details for batch {current_batch}/{total_batches}")
             for doc_id in batch_ids:
                 try:
                     # Construct the correct endpoint URL
@@ -732,7 +765,6 @@ def process_documents():
                     # Log detailed response information
                     print(f"📄 Document {doc_id} Retrieval:")
                     print(f"  Status Code: {doc_response.status_code}")
-                    print(f"  Response Headers: {dict(doc_response.headers)}")
                     
                     # Check response status
                     if doc_response.status_code == 200:
@@ -749,16 +781,17 @@ def process_documents():
                             print(f"✅ Successfully fetched details for document {doc_id}")
                         else:
                             print(f"⚠️ Skipping document {doc_id} - Processing State: {doc_details.get('processingState')}")
+                            skipped_count += 1
                     else:
                         print(f"❌ Failed to fetch details for document {doc_id}")
-                        print(f"  Response Body: {doc_response.text}")
+                        failed_count += 1
                     
                     # Be nice to the API
                     time.sleep(0.5)
                     
                 except Exception as e:
                     print(f"❌ Critical error fetching document {doc_id}: {str(e)}")
-                    print(f"Traceback: {traceback.format_exc()}")
+                    failed_count += 1
             
             # Process this batch of documents
             print(f"🔢 Processing batch of {len(batch_documents)} documents")
@@ -772,6 +805,11 @@ def process_documents():
                     else:
                         failed_count += 1
                     
+                    # Update metrics
+                    processed_metric.metric("Processed", processed_count)
+                    failed_metric.metric("Failed", failed_count)
+                    skipped_metric.metric("Skipped", skipped_count)
+                    
                     # Optional: Add a small delay to prevent overwhelming the API
                     time.sleep(0.5)
                     
@@ -779,18 +817,33 @@ def process_documents():
                     print(f"❌ Error processing individual document: {str(e)}")
                     failed_count += 1
             
-            # Update Streamlit status
-            st.session_state.processing_status = f"Processed {processed_count} out of {len(all_document_ids)} documents"
+            # Update progress message
+            status_message = (
+                f"Processed: {processed_count} | "
+                f"Failed: {failed_count} | "
+                f"Skipped: {skipped_count} | "
+                f"Progress: {progress:.1%}"
+            )
+            st.session_state.processing_status = status_message
+        
+        # Final progress update
+        progress_bar.progress(1.0)
+        status_text.text("Processing complete!")
         
         # Final summary
         print("\n🏁 Document Processing Complete!")
-        print(f"📈 Total Documents: {len(all_document_ids)}")
+        print(f"📈 Total Documents: {total_documents}")
         print(f"✅ Successfully Processed: {processed_count}")
         print(f"❌ Failed to Process: {failed_count}")
+        print(f"⚠️ Skipped: {skipped_count}")
         
         # Update session state
         st.session_state.processing_complete = True
-        st.session_state.processing_status = f"Processed {processed_count} out of {len(all_document_ids)} documents"
+        st.session_state.processing_status = (
+            f"Complete! Processed: {processed_count} | "
+            f"Failed: {failed_count} | "
+            f"Skipped: {skipped_count}"
+        )
         
     except Exception as e:
         print(f"❌ Critical error in document processing: {str(e)}")
@@ -957,7 +1010,7 @@ def main():
         if st.button("🔑 Authenticate with Shoeboxed"):
             handle_auth()
     else:
-        st.sidebar.success("✅ Authenticated")
+        st.sidebar.success("Authenticated")
         
         # Add processing controls
         if st.sidebar.button("📄 Process Documents"):
@@ -1124,7 +1177,7 @@ def fetch_document_details(account_id, doc_id, access_token):
             else:
                 download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}/download"
             
-            print(f"🔗 Checking download URL: {download_endpoint}")
+            print(f"Checking download URL: {download_endpoint}")
             
             # Make a HEAD request to verify the download URL
             download_headers = {
