@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 import requests
 from fetch_documents import fetch_documents
 from process_for_pinecone import extract_text_from_pdf, create_embedding, ProcessingState
+import logging
+import boto3
 
 # Load environment variables
 load_dotenv()
@@ -124,33 +126,80 @@ def init_pinecone():
         print(f"Error initializing Pinecone: {str(e)}")
         return None
 
-def extract_text_with_gpt4o(image_base64):
-    """Extract text from image using GPT-4 Vision"""
+def extract_text_with_gpt4o(pdf_bytes):
+    """Extract text from PDF using GPT-4o Vision"""
     try:
-        response = client.chat.completions.create(
-            model=os.getenv('OPENAI_VISION_MODEL'),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
+        # Ensure we have bytes
+        if not isinstance(pdf_bytes, bytes):
+            logging.error("Input must be bytes")
+            return None
+            
+        # Create a BytesIO object from the bytes
+        pdf_stream = BytesIO(pdf_bytes)
+        
+        # Convert PDF to images
+        try:
+            images = convert_from_bytes(pdf_stream.read())
+        except Exception as e:
+            logging.error(f"Error converting PDF to images: {str(e)}")
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            return None
+        
+        # Process first page (or all pages if needed)
+        image_texts = []
+        for i, image in enumerate(images):
+            try:
+                # Convert image to bytes
+                buffered = BytesIO()
+                image.save(buffered, format="PNG")
+                image_bytes = buffered.getvalue()
+                
+                # Base64 encode the image
+                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                
+                # Call GPT-4o
+                response = client.chat.completions.create(
+                    model=os.getenv('OPENAI_VISION_MODEL', "gpt-4-vision-preview"),
+                    messages=[
                         {
-                            "type": "text",
-                            "text": "Please extract all text from this receipt or document image. Include all numbers, dates, and details. Format it clearly."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Extract all text from this document comprehensively. Include numbers, dates, and key details. Provide a structured, clear extraction."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{image_base64}",
+                                        "detail": "high"
+                                    }
+                                }
+                            ]
                         }
-                    ]
-                }
-            ],
-            max_tokens=1500
-        )
-        return response.choices[0].message.content
+                    ],
+                    max_tokens=4096,
+                    temperature=0.2,
+                    top_p=0.1,  # More focused response
+                    frequency_penalty=0.1,  # Reduce repetition
+                    presence_penalty=0.1    # Encourage novel information
+                )
+                
+                page_text = response.choices[0].message.content
+                if page_text:
+                    image_texts.append(f"Page {i+1}:\n{page_text}")
+                
+            except Exception as e:
+                logging.error(f"Error processing page {i}: {str(e)}")
+                logging.error(f"Traceback: {traceback.format_exc()}")
+                continue
+        
+        # Combine texts from all pages
+        return "\n\n".join(image_texts) if image_texts else None
+    
     except Exception as e:
-        print(f"Error in GPT-4 Vision text extraction: {str(e)}")
+        logging.error(f"Error in GPT-4o document text extraction: {str(e)}")
+        logging.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 class OAuthHandler(http.server.BaseHTTPRequestHandler):
@@ -327,6 +376,308 @@ def handle_auth():
         st.error(error_message)
         st.session_state.authenticated = False
 
+def retrieve_all_document_ids(tokens):
+    """
+    Retrieve all document IDs with robust, resumable mechanism
+    
+    Supports:
+    - Resumable pagination
+    - Detailed filtering
+    - Comprehensive logging
+    """
+    # Determine cache file path
+    cache_file = 'document_id_cache.json'
+    
+    # Try to load existing progress
+    try:
+        with open(cache_file, 'r') as f:
+            cache_data = json.load(f)
+            last_offset = cache_data.get('last_offset', 0)
+            cached_document_ids = cache_data.get('document_ids', [])
+    except FileNotFoundError:
+        last_offset = 0
+        cached_document_ids = []
+    
+    # Get account ID
+    account_id = get_organization_id(tokens['access_token'])
+    list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
+    
+    headers = {
+        'Authorization': f'Bearer {tokens["access_token"]}',
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    # Batch processing parameters
+    batch_size = 100  # Maximum allowed by API
+    total_documents_retrieved = len(cached_document_ids)
+    
+    print(f"🔍 Resuming document ID retrieval from offset {last_offset}")
+    print(f"📦 Already cached: {total_documents_retrieved} document IDs")
+    
+    try:
+        while True:
+            # Enhanced query parameters
+            params = {
+                'offset': last_offset,
+                'limit': batch_size,
+                'processing_state': 'PROCESSED',  # Only fetch fully processed documents
+                'order_by_desc': 'uploaded',  # Sort by most recently uploaded first
+                'trashed': 'false'  # Exclude trashed documents
+            }
+            
+            print(f"📡 Fetching document batch starting at offset {last_offset}")
+            print(f"📋 Query Parameters: {params}")
+            
+            response = requests.get(list_url, headers=headers, params=params)
+            
+            # Detailed logging of API response
+            print(f"🌐 Response Status: {response.status_code}")
+            print(f"🔑 Response Headers: {dict(response.headers)}")
+            
+            if response.status_code != 200:
+                print(f"❌ Failed to fetch document list. Status: {response.status_code}")
+                print(f"Response Body: {response.text}")
+                break
+            
+            # Parse response
+            data = response.json()
+            
+            # Log total document count
+            total_count = data.get('totalCount', 0)
+            total_filtered_count = data.get('totalCountFiltered', 0)
+            print(f"📊 Total Documents: {total_count}")
+            print(f"🔍 Filtered Documents: {total_filtered_count}")
+            
+            # Extract document list
+            doc_list = data.get('documents', [])
+            
+            if not doc_list:
+                print("🏁 No more documents to retrieve")
+                break  # No more documents
+            
+            # Extract and log document details
+            new_doc_ids = []
+            for doc in doc_list:
+                doc_id = doc.get('id')
+                doc_type = doc.get('type', 'Unknown')
+                doc_uploaded = doc.get('uploaded', 'Unknown')
+                doc_vendor = doc.get('vendor', 'N/A')
+                
+                print(f"📄 Document: {doc_id}")
+                print(f"   Type: {doc_type}")
+                print(f"   Uploaded: {doc_uploaded}")
+                print(f"   Vendor: {doc_vendor}")
+                
+                new_doc_ids.append(doc_id)
+            
+            # Add new document IDs
+            cached_document_ids.extend(new_doc_ids)
+            
+            # Update progress
+            total_documents_retrieved = len(cached_document_ids)
+            last_offset += batch_size
+            
+            # Save progress periodically
+            if total_documents_retrieved % (batch_size * 10) == 0:
+                with open(cache_file, 'w') as f:
+                    json.dump({
+                        'last_offset': last_offset,
+                        'document_ids': cached_document_ids,
+                        'timestamp': datetime.now().isoformat(),
+                        'total_count': total_count,
+                        'filtered_count': total_filtered_count
+                    }, f, indent=2)
+                
+                print(f"💾 Saved progress: {total_documents_retrieved} document IDs")
+            
+            # Optional: Add a small delay to be nice to the API
+            time.sleep(0.5)
+            
+            # Break if we've retrieved all documents
+            if last_offset >= total_count:
+                print("🏁 Retrieved all documents")
+                break
+    
+    except Exception as e:
+        print(f"❌ Error retrieving document IDs: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+    
+    finally:
+        # Final save of progress
+        with open(cache_file, 'w') as f:
+            json.dump({
+                'last_offset': last_offset,
+                'document_ids': cached_document_ids,
+                'timestamp': datetime.now().isoformat(),
+                'total_count': total_count,
+                'filtered_count': total_filtered_count
+            }, f, indent=2)
+    
+    print(f"🏁 Document ID Retrieval Complete")
+    print(f"📊 Total Documents Found: {total_documents_retrieved}")
+    
+    return cached_document_ids
+
+def get_shoeboxed_headers(access_token=None):
+    """Generate headers for Shoeboxed API requests"""
+    if not access_token:
+        tokens = load_tokens()
+        access_token = tokens.get('access_token')
+    
+    return {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://api.shoeboxed.com',
+        'Referer': 'https://api.shoeboxed.com/'
+    }
+
+def download_document(doc_details, tokens):
+    """
+    Download document from Shoeboxed or S3
+    
+    Args:
+        doc_details (dict): Document details from Shoeboxed
+        tokens (dict): Authentication tokens
+    
+    Returns:
+        bytes or None: Document content or None if download fails
+    """
+    try:
+        doc_id = doc_details.get('id', 'Unknown')
+        
+        # Get attachment URL from document metadata
+        attachment = doc_details.get('attachment', {})
+        if not attachment or not attachment.get('url'):
+            logging.error(f"No attachment URL found for document {doc_id}")
+            logging.error(f"Document data: {json.dumps(doc_details, indent=2)}")
+            return None
+        
+        url = attachment['url']
+        logging.info(f"\n{'='*80}\nDownload attempt for document {doc_id}")
+        logging.info(f"URL: {url}")
+        
+        # For S3 pre-signed URLs (which is what we get from Shoeboxed),
+        # make a clean request without any additional headers
+        try:
+            logging.info(f"Making clean request to URL")
+            response = requests.get(
+                url,
+                timeout=30,
+                stream=True,
+                allow_redirects=True  # Allow redirects for pre-signed URLs
+            )
+            
+            logging.info(f"Response status: {response.status_code}")
+            logging.info(f"Response headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                content = response.content
+                if not content:
+                    logging.error("Downloaded empty content")
+                    return None
+                
+                content_length = len(content)
+                logging.info(f"Successfully downloaded {content_length} bytes")
+                return content
+            
+            # Log error information
+            logging.error(f"Download failed. Status: {response.status_code}")
+            logging.error(f"Response Headers: {dict(response.headers)}")
+            logging.error(f"Response Content: {response.text[:500]}")
+            return None
+            
+        except Exception as e:
+            logging.error(f"Download error: {str(e)}")
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            return None
+        
+    except Exception as e:
+        logging.error(f"Document download error: {str(e)}")
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+def process_single_document(doc_details, tokens, state):
+    """
+    Enhanced document processing with robust error handling
+    
+    Args:
+        doc_details (dict): Document details from Shoeboxed
+        tokens (dict): Authentication tokens
+        state (ProcessingState): Processing state tracking object
+    
+    Returns:
+        bool: Whether document processing was successful
+    """
+    try:
+        doc_id = doc_details.get('id')
+        
+        # Skip if document is already processed
+        if state.is_document_processed(doc_id):
+            logging.info(f"Document {doc_id} already processed. Skipping.")
+            return False
+        
+        # Validate document details
+        if not doc_id:
+            logging.error("Invalid document: Missing document ID")
+            return False
+        
+        # Download document
+        document_content = download_document(doc_details, tokens)
+        if not document_content:
+            logging.error(f"Failed to download document {doc_id}")
+            return False
+        
+        # Create local directory for documents
+        os.makedirs('documents', exist_ok=True)
+        local_file_path = os.path.join('documents', f"{doc_id}.pdf")
+        
+        # Save document locally
+        with open(local_file_path, 'wb') as f:
+            f.write(document_content)
+        
+        # Extract text using GPT-4o (pass the bytes directly)
+        extracted_text = extract_text_with_gpt4o(document_content)
+        if not extracted_text:
+            logging.error(f"Failed to extract text from document {doc_id}")
+            return False
+        
+        # Create embedding
+        text_embedding = create_embedding(extracted_text)
+        if not text_embedding:
+            logging.error(f"Failed to create embedding for document {doc_id}")
+            return False
+        
+        # Prepare metadata
+        metadata = {
+            'document_id': doc_id,
+            'type': doc_details.get('type', 'unknown'),
+            'vendor': doc_details.get('vendor', 'unknown'),
+            'total': doc_details.get('total', 0),
+            'uploaded_date': doc_details.get('uploaded', ''),
+            'categories': doc_details.get('categories', []),
+            'text': extracted_text[:4000]  # Truncate for storage
+        }
+        
+        # Upload to S3
+        s3_url = upload_to_s3(local_file_path, doc_id)
+        if s3_url:
+            metadata['s3_url'] = s3_url
+        
+        # Upsert to Pinecone
+        upsert_to_pinecone(doc_id, text_embedding, metadata)
+        
+        # Mark document as processed
+        state.mark_processed(doc_id)
+        
+        return True
+    
+    except Exception as e:
+        logging.error(f"Error processing document {doc_id}: {str(e)}")
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
 def process_documents():
     """Process documents from Shoeboxed in batches"""
     try:
@@ -336,75 +687,11 @@ def process_documents():
         # Refresh token if needed
         tokens = refresh_if_needed(tokens)
         
-        # Fetch document IDs first
-        print("🚀 Starting document ID retrieval...")
-        try:
-            account_id = get_organization_id(tokens['access_token'])
-            print(f"✅ Retrieved Account ID: {account_id}")
-        except Exception as account_error:
-            print(f"❌ Failed to retrieve account ID: {str(account_error)}")
-            st.error(f"Could not retrieve account ID: {str(account_error)}")
-            return
+        # Get organization ID
+        account_id = get_organization_id(tokens['access_token'])
         
-        list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
-        headers = {
-            'Authorization': f'Bearer {tokens["access_token"]}',
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        
-        # Batch processing parameters
-        batch_size = 10
-        offset = 0
-        all_document_ids = []
-        
-        # Collect all document IDs
-        while True:
-            params = {
-                'limit': 50,  # Fetch 50 document IDs at a time
-                'offset': offset,
-                'include': 'metadata'
-            }
-            
-            print(f"📡 Fetching documents with params: {params}")
-            
-            try:
-                response = requests.get(list_url, headers=headers, params=params)
-                
-                print(f"📥 Response Status: {response.status_code}")
-                print(f"📥 Response Headers: {response.headers}")
-                
-                if response.status_code != 200:
-                    print(f"❌ Failed to fetch document list. Status: {response.status_code}")
-                    print(f"❌ Response Body: {response.text}")
-                    st.error(f"Failed to fetch documents. Status: {response.status_code}")
-                    break
-                
-                data = response.json()
-                doc_list = data.get('documents', [])
-                
-                print(f"📊 Documents in this batch: {len(doc_list)}")
-                
-                # Collect document IDs
-                batch_ids = [doc['id'] for doc in doc_list]
-                all_document_ids.extend(batch_ids)
-                
-                # Check if there are more documents
-                if len(doc_list) < params['limit']:
-                    break
-                
-                offset += params['limit']
-                
-            except requests.RequestException as req_error:
-                print(f"❌ Network error during document retrieval: {str(req_error)}")
-                st.error(f"Network error: {str(req_error)}")
-                break
-            except Exception as general_error:
-                print(f"❌ Unexpected error during document retrieval: {str(general_error)}")
-                st.error(f"Unexpected error: {str(general_error)}")
-                break
-        
-        print(f"📈 Total documents found: {len(all_document_ids)}")
+        # Retrieve ALL document IDs (resumable)
+        all_document_ids = retrieve_all_document_ids(tokens)
         
         # Initialize Pinecone
         print("🔢 Initializing Pinecone vector database...")
@@ -422,6 +709,7 @@ def process_documents():
         # Process documents in batches
         processed_count = 0
         failed_count = 0
+        batch_size = 10
         
         for i in range(0, len(all_document_ids), batch_size):
             # Get batch of document IDs
@@ -432,26 +720,52 @@ def process_documents():
             print(f"\n🔍 Fetching details for batch {i//batch_size + 1}")
             for doc_id in batch_ids:
                 try:
-                    doc_url = f"{list_url}/{doc_id}"
+                    # Construct the correct endpoint URL
+                    doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
+                    
+                    # Prepare headers with proper authorization
+                    headers = get_shoeboxed_headers(tokens['access_token'])
+                    
+                    # Make the API request
                     doc_response = requests.get(doc_url, headers=headers)
                     
+                    # Log detailed response information
+                    print(f"📄 Document {doc_id} Retrieval:")
+                    print(f"  Status Code: {doc_response.status_code}")
+                    print(f"  Response Headers: {dict(doc_response.headers)}")
+                    
+                    # Check response status
                     if doc_response.status_code == 200:
                         doc_details = doc_response.json()
-                        batch_documents.append(doc_details)
-                        print(f"✅ Fetched details for document {doc_id}")
+                        
+                        # Additional logging for document details
+                        print(f"  Document Type: {doc_details.get('type', 'Unknown')}")
+                        print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}")
+                        print(f"  Uploaded: {doc_details.get('uploaded', 'Unknown')}")
+                        
+                        # Only add documents that are fully processed
+                        if doc_details.get('processingState') == 'PROCESSED':
+                            batch_documents.append(doc_details)
+                            print(f"✅ Successfully fetched details for document {doc_id}")
+                        else:
+                            print(f"⚠️ Skipping document {doc_id} - Processing State: {doc_details.get('processingState')}")
                     else:
                         print(f"❌ Failed to fetch details for document {doc_id}")
+                        print(f"  Response Body: {doc_response.text}")
                     
-                    time.sleep(0.5)  # Be nice to the API
+                    # Be nice to the API
+                    time.sleep(0.5)
+                    
                 except Exception as e:
-                    print(f"❌ Error fetching document {doc_id}: {str(e)}")
+                    print(f"❌ Critical error fetching document {doc_id}: {str(e)}")
+                    print(f"Traceback: {traceback.format_exc()}")
             
             # Process this batch of documents
             print(f"🔢 Processing batch of {len(batch_documents)} documents")
             for doc in batch_documents:
                 try:
                     # Process single document
-                    success = process_single_document(doc, documents_dir, index, state)
+                    success = process_single_document(doc, tokens, state)
                     
                     if success:
                         processed_count += 1
@@ -708,6 +1022,182 @@ def get_organization_id(access_token):
         print(f"Error getting account ID: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         raise
+
+def upload_to_s3(local_file_path, document_id):
+    try:
+        s3_client = boto3.client('s3')
+        bucket_name = os.environ.get('S3_BUCKET_NAME', 'shoeboxed-documents')
+        s3_key = f"processed_documents/{document_id}.pdf"
+        
+        # Ensure the file exists before uploading
+        if not os.path.exists(local_file_path):
+            logging.error(f"Local file not found: {local_file_path}")
+            return None
+        
+        s3_client.upload_file(
+            local_file_path, 
+            bucket_name, 
+            s3_key, 
+            ExtraArgs={'ContentType': 'application/pdf'}
+        )
+        
+        # Generate a presigned URL that expires in 7 days
+        presigned_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket_name, 'Key': s3_key},
+            ExpiresIn=7*24*3600  # 7 days
+        )
+        
+        logging.info(f"Successfully uploaded document {document_id} to S3: {s3_key}")
+        return presigned_url
+    except Exception as e:
+        logging.error(f"S3 Upload Error for document {document_id}: {str(e)}")
+        return None
+
+def upsert_to_pinecone(document_id, text_embedding, metadata):
+    try:
+        pinecone_index = init_pinecone()
+        
+        # Retry mechanism with exponential backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                pinecone_index.upsert(
+                    vectors=[(document_id, text_embedding, metadata)]
+                )
+                logging.info(f"Successfully upserted document {document_id} to Pinecone")
+                break
+            except Exception as retry_error:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logging.warning(f"Pinecone upsert attempt {attempt + 1} failed. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise retry_error
+    except Exception as e:
+        logging.error(f"Pinecone upsert error for document {document_id}: {str(e)}")
+        # Optionally, you could implement additional error handling or logging here
+
+def fetch_document_details(account_id, doc_id, access_token):
+    """
+    Fetch detailed information for a specific document using Shoeboxed V2 API.
+    
+    Args:
+        account_id (str): Shoeboxed account ID
+        doc_id (str): Document ID to fetch
+        access_token (str): OAuth access token
+    
+    Returns:
+        dict or None: Detailed document information
+    """
+    # Construct the precise API endpoint for document details
+    endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://api.shoeboxed.com',
+        'Referer': 'https://api.shoeboxed.com/',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    
+    try:
+        # First get document details
+        response = requests.get(endpoint, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            doc_data = response.json()
+            doc_type = doc_data.get('type', '').lower()
+            
+            print(f"\n🔍 Raw document data for {doc_id}:")
+            print("=" * 80)
+            print(json.dumps(doc_data, indent=2))
+            print("=" * 80)
+            
+            # Now get the download URL based on document type
+            download_endpoint = None
+            if doc_type == 'receipt':
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/receipts/{doc_id}/download"
+            elif doc_type == 'business-card':
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/business-cards/{doc_id}/download"
+            else:
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}/download"
+            
+            print(f"🔗 Checking download URL: {download_endpoint}")
+            
+            # Make a HEAD request to verify the download URL
+            download_headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/pdf,image/*',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            
+            try:
+                download_response = requests.head(
+                    download_endpoint,
+                    headers=download_headers,
+                    allow_redirects=True,
+                    timeout=10
+                )
+                
+                print(f"Download response status: {download_response.status_code}")
+                print(f"Download response headers: {dict(download_response.headers)}")
+                
+                if download_response.status_code in [200, 302]:
+                    # For S3 URLs, get the Location header from the redirect
+                    if download_response.status_code == 302:
+                        actual_download_url = download_response.headers.get('Location')
+                        print(f"🔄 Redirected to: {actual_download_url}")
+                        doc_data['attachment'] = {
+                            'url': actual_download_url,
+                            'name': f"{doc_type}_{doc_id}.pdf"
+                        }
+                    else:
+                        doc_data['attachment'] = {
+                            'url': download_endpoint,
+                            'name': f"{doc_type}_{doc_id}.pdf"
+                        }
+                    print(f"✅ Successfully added download URL to document {doc_id}")
+                else:
+                    print(f"❌ Failed to verify download URL for document {doc_id}")
+                    print(f"Response status: {download_response.status_code}")
+                    print(f"Response headers: {download_response.headers}")
+            except Exception as e:
+                print(f"❌ Error checking download URL: {str(e)}")
+                print(f"Traceback: {traceback.format_exc()}")
+            
+            # Add account ID to document data
+            doc_data['accountId'] = account_id
+            
+            # Validate processing state
+            processing_state = doc_data.get('processingState')
+            if processing_state not in ['PROCESSED', 'NEEDS_USER_PROCESSING']:
+                print(f"⚠️ Document {doc_id} in non-standard processing state: {processing_state}")
+            
+            # Enrich document metadata
+            doc_data['metadata'] = {
+                'uploaded': doc_data.get('uploaded'),
+                'modified': doc_data.get('modified'),
+                'vendor': doc_data.get('vendor'),
+                'total': doc_data.get('total'),
+                'type': doc_type,
+                'processing_state': processing_state,
+                'accountId': account_id
+            }
+            
+            return doc_data
+        
+        # Log unsuccessful responses
+        print(f"❌ Failed to fetch document {doc_id}. Status: {response.status_code}")
+        print(f"Response body: {response.text}")
+        
+        return None
+    
+    except Exception as e:
+        print(f"❌ Error fetching document {doc_id}: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return None
 
 if __name__ == "__main__":
     main()
