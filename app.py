@@ -379,16 +379,27 @@ def handle_auth():
 
 def retrieve_all_document_ids(tokens, checkpoint):
     """
-    Retrieve all document IDs with robust, resumable mechanism
+    Retrieve document IDs with robust resumption and date-based filtering
     
     Args:
         tokens (dict): Authentication tokens
         checkpoint (ProcessingCheckpoint): Checkpoint system for tracking progress
     """
-    # Determine cache file path
+    # Determine cache file path and metadata file path
     cache_file = 'document_id_cache.json'
+    metadata_file = 'retrieval_metadata.json'
     
-    # Try to load existing progress
+    # Load or initialize retrieval metadata
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            last_successful_date = metadata.get('last_successful_date')
+            last_offset = metadata.get('last_offset', 0)
+    except FileNotFoundError:
+        last_successful_date = None
+        last_offset = 0
+    
+    # Try to load existing document cache
     try:
         with open(cache_file, 'r') as f:
             cache_data = json.load(f)
@@ -401,32 +412,37 @@ def retrieve_all_document_ids(tokens, checkpoint):
             ]
             
             print(f"📦 Loaded {len(cached_document_ids)} unprocessed documents from cache")
-            if cached_document_ids:
-                return cached_document_ids
     except FileNotFoundError:
         print("No cache file found, starting fresh document retrieval")
+        cached_document_ids = []
     
-    # If we get here, we need to fetch documents from the API
+    # Get account ID and prepare API endpoint
     account_id = get_organization_id(tokens['access_token'])
     list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
-    
     headers = get_shoeboxed_headers(tokens['access_token'])
     
     # Batch processing parameters
     batch_size = 100  # Maximum allowed by API
-    last_offset = 0
-    all_document_ids = []
+    all_document_ids = cached_document_ids.copy()
+    current_offset = last_offset
     
     try:
         while True:
+            # Prepare query parameters with date filtering if available
             params = {
-                'offset': last_offset,
+                'offset': current_offset,
                 'limit': batch_size,
                 'order_by_desc': 'uploaded',
                 'trashed': 'false'
             }
             
-            print(f"📡 Fetching document batch starting at offset {last_offset}")
+            # Add date filter if we have a last successful date
+            if last_successful_date:
+                params['modified_since'] = last_successful_date
+            
+            print(f"📡 Fetching document batch starting at offset {current_offset}")
+            if last_successful_date:
+                print(f"   Filtering for documents modified since {last_successful_date}")
             
             response = requests.get(list_url, headers=headers, params=params)
             
@@ -440,30 +456,72 @@ def retrieve_all_document_ids(tokens, checkpoint):
             if not doc_list:
                 break
             
-            # Filter documents that haven't been processed yet
-            new_doc_ids = [
-                doc.get('id') for doc in doc_list 
-                if doc.get('id') and checkpoint.should_process_doc(doc.get('id'))
-            ]
+            # Process and filter documents
+            new_docs = []
+            for doc in doc_list:
+                doc_id = doc.get('id')
+                if not doc_id:
+                    continue
+                    
+                # Skip if already processed
+                if not checkpoint.should_process_doc(doc_id):
+                    continue
+                    
+                # Track the latest modification date
+                modified_date = doc.get('modified')
+                if modified_date:
+                    if not last_successful_date or modified_date > last_successful_date:
+                        last_successful_date = modified_date
+                
+                new_docs.append(doc_id)
             
-            all_document_ids.extend(new_doc_ids)
-            print(f"✅ Found {len(new_doc_ids)} unprocessed documents in this batch")
+            # Update progress
+            all_document_ids.extend(new_docs)
+            print(f"✅ Found {len(new_docs)} new unprocessed documents in this batch")
             
-            last_offset += batch_size
-            if last_offset >= data.get('totalCount', 0):
+            # Save progress periodically
+            if len(new_docs) > 0:
+                # Save document cache
+                with open(cache_file, 'w') as f:
+                    json.dump({
+                        'document_ids': all_document_ids,
+                        'timestamp': datetime.now().isoformat()
+                    }, f, indent=2)
+                
+                # Save retrieval metadata
+                with open(metadata_file, 'w') as f:
+                    json.dump({
+                        'last_successful_date': last_successful_date,
+                        'last_offset': current_offset,
+                        'total_documents': len(all_document_ids),
+                        'last_update': datetime.now().isoformat()
+                    }, f, indent=2)
+            
+            # Update offset and check if we've retrieved all documents
+            current_offset += batch_size
+            if current_offset >= data.get('totalCount', 0):
                 break
             
-            time.sleep(0.5)
+            time.sleep(0.5)  # Be nice to the API
     
     except Exception as e:
         print(f"❌ Error retrieving document IDs: {str(e)}")
-    
-    # Save to cache
-    with open(cache_file, 'w') as f:
-        json.dump({
-            'document_ids': all_document_ids,
-            'timestamp': datetime.now().isoformat()
-        }, f, indent=2)
+        # Save progress even if we encounter an error
+        if len(all_document_ids) > len(cached_document_ids):
+            with open(cache_file, 'w') as f:
+                json.dump({
+                    'document_ids': all_document_ids,
+                    'timestamp': datetime.now().isoformat()
+                }, f, indent=2)
+            
+            with open(metadata_file, 'w') as f:
+                json.dump({
+                    'last_successful_date': last_successful_date,
+                    'last_offset': current_offset,
+                    'total_documents': len(all_document_ids),
+                    'last_update': datetime.now().isoformat(),
+                    'error': str(e)
+                }, f, indent=2)
     
     print(f"📊 Total unprocessed documents found: {len(all_document_ids)}")
     return all_document_ids
@@ -734,7 +792,7 @@ def process_documents():
         print(f"\n📊 Found {total_documents} documents to process")
         
         # Initialize Pinecone
-        print("\n🔢 Initializing Pinecone vector database...")
+        print("\n🔄 Initializing Pinecone vector database...")
         index = init_pinecone()
         
         # Create documents directory
@@ -1014,28 +1072,42 @@ def reset_processing_state():
         print("🔄 Clearing Pinecone index...")
         index = init_pinecone()
         if index:
-            index.delete(delete_all=True)
-            print("✅ Pinecone index cleared")
+            try:
+                index.delete(delete_all=True)
+                print("✅ Pinecone index cleared")
+            except Exception as e:
+                if '404' in str(e):
+                    print("ℹ️ Pinecone index is already empty")
+                else:
+                    print(f"⚠️ Error clearing Pinecone index: {str(e)}")
         
         # Delete local files
         files_to_delete = [
             'processing_checkpoint.json',
-            'document_id_cache.json'
+            'document_id_cache.json',
+            'retrieval_metadata.json'  # Add new metadata file
         ]
         
         for file in files_to_delete:
             if os.path.exists(file):
                 os.remove(file)
                 print(f"✅ Deleted {file}")
+            else:
+                print(f"ℹ️ File not found: {file}")
         
         # Clear document directories
+        found_dirs = False
         for dir_name in os.listdir('.'):
             if dir_name.startswith('documents_'):
+                found_dirs = True
                 try:
                     shutil.rmtree(dir_name)
                     print(f"✅ Deleted directory {dir_name}")
                 except Exception as e:
                     print(f"⚠️ Error deleting directory {dir_name}: {str(e)}")
+        
+        if not found_dirs:
+            print("ℹ️ No document directories found to clean")
         
         # Clear S3 bucket
         try:
