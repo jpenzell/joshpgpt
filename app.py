@@ -389,52 +389,11 @@ def retrieve_all_document_ids(tokens, checkpoint):
     running_count = st.empty()
     total_to_process = 0
     
-    # Determine cache file path and metadata file path
-    cache_file = 'document_id_cache.json'
-    metadata_file = 'retrieval_metadata.json'
-    
     print("\n📋 Document Processing Status:")
     print("--------------------------------")
     print(f"✅ Fully Processed (in Pinecone): {len(checkpoint.processed_docs)}")
     print(f"❌ Failed Documents: {len(checkpoint.failed_docs)}")
     print(f"⏭️ Skipped Documents: {len(checkpoint.skipped_docs)}")
-    
-    # Load or initialize retrieval metadata
-    try:
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
-            last_successful_date = metadata.get('last_successful_date')
-            last_offset = metadata.get('last_offset', 0)
-            total_to_process = metadata.get('total_to_process', 0)
-            print(f"📅 Last Successful Date: {last_successful_date}")
-            print(f"📍 Last Offset: {last_offset}")
-            print(f"📊 Previously Found To Process: {total_to_process}")
-            
-            # Update the running count display
-            running_count.metric("Documents To Process", total_to_process)
-    except FileNotFoundError:
-        last_successful_date = None
-        last_offset = 0
-        print("🆕 Starting fresh document retrieval")
-    
-    # Try to load existing document cache
-    try:
-        with open(cache_file, 'r') as f:
-            cache_data = json.load(f)
-            cached_document_ids = cache_data.get('document_ids', [])
-            
-            # Filter out documents that have been fully processed (in Pinecone)
-            cached_document_ids = [
-                doc_id for doc_id in cached_document_ids 
-                if checkpoint.should_process_doc(doc_id)
-            ]
-            
-            print(f"📦 Loaded {len(cached_document_ids)} documents from cache that need processing")
-            total_to_process = len(cached_document_ids)
-            running_count.metric("Documents To Process", total_to_process)
-    except FileNotFoundError:
-        print("No cache file found, starting fresh document retrieval")
-        cached_document_ids = []
     
     # Get account ID and prepare API endpoint
     account_id = get_organization_id(tokens['access_token'])
@@ -443,12 +402,28 @@ def retrieve_all_document_ids(tokens, checkpoint):
     
     # Batch processing parameters
     batch_size = 100  # Maximum allowed by API
-    all_document_ids = cached_document_ids.copy()
-    current_offset = last_offset
+    all_document_ids = []
+    current_offset = 0
     
     try:
+        # First get total count
+        params = {
+            'offset': 0,
+            'limit': 1,
+            'order_by_desc': 'uploaded',
+            'trashed': 'false'
+        }
+        
+        response = requests.get(list_url, headers=headers, params=params)
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch document count. Status: {response.status_code}")
+            return []
+            
+        total_count = response.json().get('totalCount', 0)
+        print(f"\n📊 Total documents in Shoeboxed: {total_count}")
+        
         while True:
-            # Prepare query parameters with date filtering if available
+            # Prepare query parameters
             params = {
                 'offset': current_offset,
                 'limit': batch_size,
@@ -456,13 +431,7 @@ def retrieve_all_document_ids(tokens, checkpoint):
                 'trashed': 'false'
             }
             
-            # Add date filter if we have a last successful date
-            if last_successful_date:
-                params['modified_since'] = last_successful_date
-            
             print(f"\n📡 Fetching document batch starting at offset {current_offset}")
-            if last_successful_date:
-                print(f"   Filtering for documents modified since {last_successful_date}")
             
             response = requests.get(list_url, headers=headers, params=params)
             
@@ -477,7 +446,6 @@ def retrieve_all_document_ids(tokens, checkpoint):
                 break
             
             # Process and filter documents
-            new_docs = []
             batch_stats = {
                 'total': 0,
                 'to_process': 0
@@ -490,22 +458,15 @@ def retrieve_all_document_ids(tokens, checkpoint):
                 
                 batch_stats['total'] += 1
                 
-                # Skip if already fully processed in our system
-                if not checkpoint.should_process_doc(doc_id):
+                # Only skip if successfully processed
+                if doc_id in checkpoint.processed_docs:
                     continue
                 
                 batch_stats['to_process'] += 1
-                
-                # Track the latest modification date
-                modified_date = doc.get('modified')
-                if modified_date:
-                    if not last_successful_date or modified_date > last_successful_date:
-                        last_successful_date = modified_date
-                
-                new_docs.append(doc_id)
+                all_document_ids.append(doc_id)
             
             # Update total count and display
-            total_to_process += batch_stats['to_process']
+            total_to_process = len(all_document_ids)
             running_count.metric("Documents To Process", total_to_process)
             
             # Log batch statistics
@@ -514,57 +475,19 @@ def retrieve_all_document_ids(tokens, checkpoint):
             print(f"   To Process: {batch_stats['to_process']}")
             print(f"   Running Total To Process: {total_to_process}")
             
-            # Update progress
-            all_document_ids.extend(new_docs)
-            
-            # Save progress periodically
-            if len(new_docs) > 0:
-                # Save document cache
-                with open(cache_file, 'w') as f:
-                    json.dump({
-                        'document_ids': all_document_ids,
-                        'timestamp': datetime.now().isoformat()
-                    }, f, indent=2)
-                
-                # Save retrieval metadata
-                with open(metadata_file, 'w') as f:
-                    json.dump({
-                        'last_successful_date': last_successful_date,
-                        'last_offset': current_offset,
-                        'total_documents': len(all_document_ids),
-                        'total_to_process': total_to_process,
-                        'last_update': datetime.now().isoformat()
-                    }, f, indent=2)
-            
             # Update offset and check if we've retrieved all documents
             current_offset += batch_size
-            if current_offset >= data.get('totalCount', 0):
+            if current_offset >= total_count:
                 break
             
             time.sleep(0.5)  # Be nice to the API
     
     except Exception as e:
         print(f"❌ Error retrieving document IDs: {str(e)}")
-        # Save progress even if we encounter an error
-        if len(all_document_ids) > len(cached_document_ids):
-            with open(cache_file, 'w') as f:
-                json.dump({
-                    'document_ids': all_document_ids,
-                    'timestamp': datetime.now().isoformat()
-                }, f, indent=2)
-            
-            with open(metadata_file, 'w') as f:
-                json.dump({
-                    'last_successful_date': last_successful_date,
-                    'last_offset': current_offset,
-                    'total_documents': len(all_document_ids),
-                    'total_to_process': total_to_process,
-                    'last_update': datetime.now().isoformat(),
-                    'error': str(e)
-                }, f, indent=2)
+        print(traceback.format_exc())
     
     print(f"\n📊 Final Statistics:")
-    print(f"   Total Documents Found: {len(all_document_ids)}")
+    print(f"   Total Documents Found: {total_count}")
     print(f"   Already in Pinecone: {len(checkpoint.processed_docs)}")
     print(f"   Failed Previously: {len(checkpoint.failed_docs)}")
     print(f"   Skipped: {len(checkpoint.skipped_docs)}")
@@ -665,6 +588,8 @@ def process_single_document(doc_details, tokens, state):
         print(f"  Total Amount: ${doc_details.get('total', 'N/A')}", flush=True)
         print(f"  Categories: {', '.join(doc_details.get('categories', ['None']))}", flush=True)
         print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}", flush=True)
+        if doc_id in state.failed_docs:
+            print(f"  Previous Failure: {state.failure_reasons.get(doc_id, 'Unknown reason')}", flush=True)
         print(f"{'='*80}", flush=True)
         
         # Skip if document is already processed in our system
@@ -676,6 +601,7 @@ def process_single_document(doc_details, tokens, state):
         print(f"\n📥 Downloading document...", flush=True)
         document_content = download_document(doc_details, tokens)
         if not document_content:
+            state.mark_failed(doc_id, "Failed to download document")
             print(f"❌ Failed to download document {doc_id}", flush=True)
             print(f"   Document details: {json.dumps(doc_details, indent=2)}", flush=True)
             return False
@@ -695,6 +621,7 @@ def process_single_document(doc_details, tokens, state):
         extracted_text = extract_text_with_gpt4o(document_content)
         extraction_time = time.time() - start_time
         if not extracted_text:
+            state.mark_failed(doc_id, "Failed to extract text")
             print(f"❌ Failed to extract text from document {doc_id}")
             return False
         print(f"✅ Successfully extracted text:")
@@ -708,6 +635,7 @@ def process_single_document(doc_details, tokens, state):
         text_embedding = create_embedding(extracted_text)
         embedding_time = time.time() - start_time
         if not text_embedding:
+            state.mark_failed(doc_id, "Failed to create embedding")
             print(f"❌ Failed to create embedding for document {doc_id}")
             return False
         print(f"✅ Created embedding vector")
@@ -720,6 +648,7 @@ def process_single_document(doc_details, tokens, state):
         s3_url = upload_to_s3(local_file_path, doc_id)
         upload_time = time.time() - start_time
         if not s3_url:
+            state.mark_failed(doc_id, "Failed to upload to S3")
             print(f"❌ Failed to upload document {doc_id} to S3")
             return False
         print(f"✅ Uploaded to S3:")
@@ -748,10 +677,15 @@ def process_single_document(doc_details, tokens, state):
         # Upsert to Pinecone
         print(f"\n📤 Upserting to Pinecone...")
         start_time = time.time()
-        upsert_to_pinecone(doc_id, text_embedding, metadata)
-        upsert_time = time.time() - start_time
-        print(f"✅ Successfully upserted to Pinecone")
-        print(f"   Time taken: {upsert_time:.2f} seconds")
+        try:
+            upsert_to_pinecone(doc_id, text_embedding, metadata)
+            upsert_time = time.time() - start_time
+            print(f"✅ Successfully upserted to Pinecone")
+            print(f"   Time taken: {upsert_time:.2f} seconds")
+        except Exception as e:
+            state.mark_failed(doc_id, f"Failed to upsert to Pinecone: {str(e)}")
+            print(f"❌ Failed to upsert to Pinecone: {str(e)}")
+            return False
         
         # Mark document as processed
         state.mark_processed(doc_id)
@@ -762,9 +696,10 @@ def process_single_document(doc_details, tokens, state):
         return True
     
     except Exception as e:
+        error_msg = f"Error type: {type(e).__name__}, Message: {str(e)}"
+        state.mark_failed(doc_id, error_msg)
         print(f"\n❌ Error processing document {doc_id}:")
-        print(f"   Error type: {type(e).__name__}")
-        print(f"   Error message: {str(e)}")
+        print(f"   {error_msg}")
         print(f"   Traceback:")
         print(traceback.format_exc())
         print(f"{'='*80}\n")
@@ -777,6 +712,7 @@ class ProcessingCheckpoint:
         self.processed_docs = set()
         self.failed_docs = set()
         self.skipped_docs = set()
+        self.failure_reasons = {}  # Track why each document failed
         self.last_processed_time = None
         self.load_checkpoint()
     
@@ -790,11 +726,17 @@ class ProcessingCheckpoint:
                     self.processed_docs = set(data.get('processed_docs', []))
                     self.failed_docs = set(data.get('failed_docs', []))
                     self.skipped_docs = set(data.get('skipped_docs', []))
+                    self.failure_reasons = data.get('failure_reasons', {})
                     self.last_processed_time = data.get('last_processed_time')
                 print(f"📥 Loaded checkpoint: Batch {self.current_batch}")
                 print(f"✅ Processed: {len(self.processed_docs)} documents")
                 print(f"❌ Failed: {len(self.failed_docs)} documents")
                 print(f"⏭️ Skipped: {len(self.skipped_docs)} documents")
+                if self.failed_docs:
+                    print("\n❌ Failed Documents and Reasons:")
+                    for doc_id in self.failed_docs:
+                        reason = self.failure_reasons.get(doc_id, "Unknown reason")
+                        print(f"   {doc_id}: {reason}")
         except Exception as e:
             print(f"⚠️ Error loading checkpoint: {str(e)}")
     
@@ -806,6 +748,7 @@ class ProcessingCheckpoint:
                 'processed_docs': list(self.processed_docs),
                 'failed_docs': list(self.failed_docs),
                 'skipped_docs': list(self.skipped_docs),
+                'failure_reasons': self.failure_reasons,
                 'last_processed_time': datetime.now().isoformat()
             }
             with open(self.checkpoint_file, 'w') as f:
@@ -817,11 +760,15 @@ class ProcessingCheckpoint:
     def mark_processed(self, doc_id):
         """Mark a document as processed"""
         self.processed_docs.add(doc_id)
+        if doc_id in self.failed_docs:
+            self.failed_docs.remove(doc_id)
+            self.failure_reasons.pop(doc_id, None)
         self.save_checkpoint()
     
-    def mark_failed(self, doc_id):
-        """Mark a document as failed"""
+    def mark_failed(self, doc_id, reason="Unknown error"):
+        """Mark a document as failed with a reason"""
         self.failed_docs.add(doc_id)
+        self.failure_reasons[doc_id] = reason
         self.save_checkpoint()
     
     def mark_skipped(self, doc_id):
@@ -836,8 +783,8 @@ class ProcessingCheckpoint:
     
     def should_process_doc(self, doc_id):
         """Check if document should be processed"""
+        # Only skip if successfully processed or explicitly skipped
         return doc_id not in self.processed_docs and \
-               doc_id not in self.failed_docs and \
                doc_id not in self.skipped_docs
 
 def process_documents():
