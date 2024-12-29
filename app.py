@@ -657,23 +657,29 @@ def process_single_document(doc_details, tokens, state):
     """
     try:
         doc_id = doc_details.get('id')
-        print(f"\n📄 Processing document {doc_id}:")
-        print(f"  Type: {doc_details.get('type')}")
-        print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}")
-        print(f"  Upload Date: {doc_details.get('uploaded')}")
+        print(f"\n{'='*80}", flush=True)
+        print(f"📄 Processing document {doc_id}:", flush=True)
+        print(f"  Type: {doc_details.get('type')}", flush=True)
+        print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}", flush=True)
+        print(f"  Upload Date: {doc_details.get('uploaded')}", flush=True)
+        print(f"  Total Amount: ${doc_details.get('total', 'N/A')}", flush=True)
+        print(f"  Categories: {', '.join(doc_details.get('categories', ['None']))}", flush=True)
+        print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}", flush=True)
+        print(f"{'='*80}", flush=True)
         
         # Skip if document is already processed in our system
         if not state.should_process_doc(doc_id):
-            print(f"⏭️  Document {doc_id} already processed in our system. Skipping.")
+            print(f"⏭️  Document {doc_id} already processed in our system. Skipping.", flush=True)
             return False
         
         # Download document
-        print(f"📥 Downloading document...")
+        print(f"\n📥 Downloading document...", flush=True)
         document_content = download_document(doc_details, tokens)
         if not document_content:
-            print(f"❌ Failed to download document {doc_id}")
+            print(f"❌ Failed to download document {doc_id}", flush=True)
+            print(f"   Document details: {json.dumps(doc_details, indent=2)}", flush=True)
             return False
-        print(f"✅ Downloaded document: {len(document_content)} bytes")
+        print(f"✅ Downloaded document: {len(document_content):,} bytes", flush=True)
         
         # Save document locally
         os.makedirs('documents', exist_ok=True)
@@ -681,30 +687,44 @@ def process_single_document(doc_details, tokens, state):
         with open(local_file_path, 'wb') as f:
             f.write(document_content)
         print(f"💾 Saved document locally: {local_file_path}")
+        print(f"   File size: {os.path.getsize(local_file_path):,} bytes")
         
         # Extract text using GPT-4V
-        print(f"🔍 Extracting text using {os.getenv('OPENAI_VISION_MODEL', 'gpt-4-vision-preview')}...")
+        print(f"\n🔍 Extracting text using {os.getenv('OPENAI_VISION_MODEL', 'gpt-4-vision-preview')}...")
+        start_time = time.time()
         extracted_text = extract_text_with_gpt4o(document_content)
+        extraction_time = time.time() - start_time
         if not extracted_text:
             print(f"❌ Failed to extract text from document {doc_id}")
             return False
-        print(f"✅ Successfully extracted text ({len(extracted_text)} characters)")
+        print(f"✅ Successfully extracted text:")
+        print(f"   Characters: {len(extracted_text):,}")
+        print(f"   Words: {len(extracted_text.split()):,}")
+        print(f"   Time taken: {extraction_time:.2f} seconds")
         
         # Create embedding
-        print(f"🧮 Creating embedding...")
+        print(f"\n🧮 Creating embedding...")
+        start_time = time.time()
         text_embedding = create_embedding(extracted_text)
+        embedding_time = time.time() - start_time
         if not text_embedding:
             print(f"❌ Failed to create embedding for document {doc_id}")
             return False
         print(f"✅ Created embedding vector")
+        print(f"   Vector dimensions: {len(text_embedding)}")
+        print(f"   Time taken: {embedding_time:.2f} seconds")
         
         # Upload to S3
-        print(f"☁️  Uploading to S3...")
+        print(f"\n☁️  Uploading to S3...")
+        start_time = time.time()
         s3_url = upload_to_s3(local_file_path, doc_id)
+        upload_time = time.time() - start_time
         if not s3_url:
             print(f"❌ Failed to upload document {doc_id} to S3")
             return False
-        print(f"✅ Uploaded to S3: {s3_url}")
+        print(f"✅ Uploaded to S3:")
+        print(f"   URL: {s3_url}")
+        print(f"   Time taken: {upload_time:.2f} seconds")
         
         # Prepare metadata
         metadata = {
@@ -722,23 +742,32 @@ def process_single_document(doc_details, tokens, state):
         metadata = {k: v for k, v in metadata.items() if v is not None}
         
         # Log metadata before upsert
-        print(f"📝 Prepared metadata:")
+        print(f"\n📝 Document Metadata:")
         print(json.dumps(metadata, indent=2))
         
         # Upsert to Pinecone
-        print(f"📤 Upserting to Pinecone...")
+        print(f"\n📤 Upserting to Pinecone...")
+        start_time = time.time()
         upsert_to_pinecone(doc_id, text_embedding, metadata)
+        upsert_time = time.time() - start_time
         print(f"✅ Successfully upserted to Pinecone")
+        print(f"   Time taken: {upsert_time:.2f} seconds")
         
         # Mark document as processed
         state.mark_processed(doc_id)
-        print(f"✅ Document {doc_id} fully processed")
+        print(f"\n✅ Document {doc_id} fully processed")
+        print(f"Total processing time: {extraction_time + embedding_time + upload_time + upsert_time:.2f} seconds")
+        print(f"{'='*80}\n")
         
         return True
     
     except Exception as e:
-        print(f"❌ Error processing document {doc_id}: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
+        print(f"\n❌ Error processing document {doc_id}:")
+        print(f"   Error type: {type(e).__name__}")
+        print(f"   Error message: {str(e)}")
+        print(f"   Traceback:")
+        print(traceback.format_exc())
+        print(f"{'='*80}\n")
         return False
 
 class ProcessingCheckpoint:
@@ -814,28 +843,43 @@ class ProcessingCheckpoint:
 def process_documents():
     """Process documents from Shoeboxed in batches"""
     try:
+        print("\n🔍 DEBUG: Starting document processing...", flush=True)
+        
         # Initialize checkpoint system first
         checkpoint = ProcessingCheckpoint()
-        print("\n📋 Loading checkpoint...")
+        print("\n📋 Loading checkpoint...", flush=True)
+        
+        # Record start time
+        start_time = time.time()
         
         # Load tokens
+        print("\n🔑 DEBUG: Loading tokens...", flush=True)
         tokens = load_tokens()
         tokens = refresh_if_needed(tokens)
         
         # Get organization ID
+        print("\n🏢 DEBUG: Getting organization ID...", flush=True)
         account_id = get_organization_id(tokens['access_token'])
+        print(f"   Organization ID: {account_id}", flush=True)
         
         # Retrieve only unprocessed document IDs
-        print("\n🔍 Retrieving unprocessed documents...")
+        print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
         all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
+        print(f"   Found {total_documents} documents", flush=True)
         
         if total_documents == 0:
             print("✅ No new documents to process!")
             st.success("All documents have been processed!")
             return
         
-        print(f"\n📊 Found {total_documents} documents to process")
+        print(f"\n📊 Processing Summary:")
+        print(f"{'='*80}")
+        print(f"Total Documents to Process: {total_documents:,}")
+        print(f"Already Processed: {len(checkpoint.processed_docs):,}")
+        print(f"Previously Failed: {len(checkpoint.failed_docs):,}")
+        print(f"Previously Skipped: {len(checkpoint.skipped_docs):,}")
+        print(f"{'='*80}\n")
         
         # Initialize Pinecone
         print("\n🔄 Initializing Pinecone vector database...")
