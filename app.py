@@ -663,7 +663,7 @@ def process_single_document(doc_details, tokens, state):
         print(f"  Upload Date: {doc_details.get('uploaded')}")
         
         # Skip if document is already processed in our system
-        if state.is_document_processed(doc_id):
+        if not state.should_process_doc(doc_id):
             print(f"⏭️  Document {doc_id} already processed in our system. Skipping.")
             return False
         
@@ -936,7 +936,7 @@ def process_documents():
                     skipped_metric.metric("Skipped", skipped_count)
                     
                     # Save progress after each document
-                    checkpoint.save()
+                    checkpoint.save_checkpoint()
                     
                 except Exception as e:
                     print(f"❌ Error processing document {doc_id}: {str(e)}")
@@ -1460,6 +1460,36 @@ def fetch_document_details(account_id, doc_id, access_token):
         print(f"❌ Error fetching document {doc_id}: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         return None
+
+def create_document_metadata(doc_data, extracted_text):
+    """Create metadata for document storage"""
+    return {
+        'document_id': doc_data.get('id'),
+        'type': doc_data.get('type', 'unknown'),
+        'vendor': doc_data.get('vendor') or 'unknown',
+        'total': float(doc_data.get('total', 0) or 0),
+        'uploaded_date': doc_data.get('uploaded', '') or '',
+        'categories': doc_data.get('categories', []) or [],
+        'text': (extracted_text[:4000] if extracted_text else '') or '',
+        'processing_state': doc_data.get('processingState', 'unknown'),
+        'modified_date': doc_data.get('modified', '') or ''
+    }
+
+def store_in_pinecone(index, doc_id, extracted_text, metadata):
+    """Store document in Pinecone"""
+    try:
+        # Create embedding for the text
+        text_embedding = create_embedding(extracted_text)
+        if not text_embedding:
+            print(f"❌ Failed to create embedding for document {doc_id}")
+            return False
+            
+        # Upsert to Pinecone
+        upsert_to_pinecone(doc_id, text_embedding, metadata)
+        return True
+    except Exception as e:
+        print(f"❌ Error storing document {doc_id} in Pinecone: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     main()
