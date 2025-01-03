@@ -1,0 +1,22 @@
+def extract_text_from_pdf(doc, access_token):
+    """Extract text from PDF using GPT-4o Vision with improved error handling"""
+    try:
+        # Get document attachment
+        attachment = doc.get('attachment', {})
+        if not attachment:
+            print(f"No attachment found for document {doc['id']}")
+            return None
+        
+        # Download PDF with retry
+        @retry_with_backoff
+        def download_pdf():
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/pdf,image/*',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Origin': 'https://api.shoeboxed.com',
+                'Referer': 'https://api.shoeboxed.com/'
+            }
+            response = requests.get(attachment['url'], headers=headers)
+            response.raise_for_status()
+            return response.content 

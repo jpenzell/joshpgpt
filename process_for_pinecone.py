@@ -99,8 +99,57 @@ def extract_text_with_vision(image_base64):
         print(f"Error in GPT-4o Vision API call: {str(e)}")
         raise
 
+def download_document(doc, access_token):
+    """Download document from Shoeboxed with improved error handling"""
+    try:
+        # Get attachment URL from document metadata
+        attachment = doc.get('attachment', {})
+        if not attachment or not attachment.get('url'):
+            print(f"No attachment URL found for document {doc.get('id', 'Unknown')}")
+            return None
+            
+        url = attachment['url']
+        print(f"📥 Downloading from URL: {url}")
+        
+        # Make request with proper headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/pdf,image/*',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Origin': 'https://api.shoeboxed.com',
+            'Referer': 'https://api.shoeboxed.com/'
+        }
+        
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=30,
+            stream=True,
+            allow_redirects=True
+        )
+        
+        print(f"📥 Download response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            content = response.content
+            if not content:
+                print("❌ Downloaded empty content")
+                return None
+                
+            print(f"✅ Successfully downloaded {len(content):,} bytes")
+            return content
+            
+        print(f"❌ Download failed. Status: {response.status_code}")
+        print(f"Response Headers: {dict(response.headers)}")
+        return None
+        
+    except Exception as e:
+        print(f"❌ Download error: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return None
+
 def extract_text_from_pdf(doc, access_token):
-    """Extract text from PDF using GPT-4 Vision with improved error handling"""
+    """Extract text from PDF using GPT-4o Vision with improved error handling"""
     try:
         # Get document attachment
         attachment = doc.get('attachment', {})
@@ -111,49 +160,66 @@ def extract_text_from_pdf(doc, access_token):
         # Download PDF with retry
         @retry_with_backoff
         def download_pdf():
-            headers = {'Authorization': f'Bearer {access_token}'}
+            headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/pdf,image/*',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Origin': 'https://api.shoeboxed.com',
+                'Referer': 'https://api.shoeboxed.com/'
+            }
             response = requests.get(attachment['url'], headers=headers)
             response.raise_for_status()
             return response.content
             
-        pdf_content = download_pdf()
-        
-        # Convert PDF to images
         try:
+            pdf_content = download_pdf()
+            if not pdf_content:
+                print(f"❌ No content downloaded for document {doc['id']}")
+                return None
+                
+            # Convert PDF to images
             pdf_bytes = BytesIO(pdf_content)
             images = convert_from_bytes(pdf_bytes.read())
-        except Exception as e:
-            print(f"Error converting PDF to images: {str(e)}")
-            # If conversion fails, try processing as image directly
-            images = [pdf_content]
-        
-        # Process each page/image
-        extracted_text = []
-        for i, image in enumerate(images):
-            try:
-                # Convert image to base64
-                buffered = BytesIO()
-                if isinstance(image, bytes):
-                    image_bytes = image
-                else:
+            
+            if not images:
+                print(f"❌ No images extracted from PDF for document {doc['id']}")
+                return None
+                
+            # Process each page/image
+            extracted_text = []
+            for i, image in enumerate(images):
+                try:
+                    # Convert image to base64
+                    buffered = BytesIO()
                     image.save(buffered, format="JPEG", quality=95)
                     image_bytes = buffered.getvalue()
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    # Extract text using GPT-4 Vision with retry
+                    page_text = extract_text_with_vision(image_base64)
+                    if page_text:
+                        extracted_text.append(f"Page {i + 1}:\n{page_text}")
+                    else:
+                        print(f"⚠️ No text extracted from page {i + 1}")
+                        
+                except Exception as e:
+                    print(f"❌ Error processing page {i + 1}: {str(e)}")
+                    print(f"Traceback: {traceback.format_exc()}")
+                    continue
+            
+            if not extracted_text:
+                print(f"❌ No text extracted from any page for document {doc['id']}")
+                return None
                 
-                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-                
-                # Extract text using GPT-4 Vision with retry
-                page_text = extract_text_with_vision(image_base64)
-                if page_text:
-                    extracted_text.append(f"Page {i + 1}:\n{page_text}")
-                
-            except Exception as e:
-                print(f"Error processing page {i}: {str(e)}")
-                continue
-        
-        return "\n\n".join(extracted_text) if extracted_text else None
-    
+            return "\n\n".join(extracted_text)
+            
+        except Exception as e:
+            print(f"❌ Error processing PDF: {str(e)}")
+            print(f"Traceback: {traceback.format_exc()}")
+            return None
+            
     except Exception as e:
-        print(f"Error in extract_text_from_pdf: {str(e)}")
+        print(f"❌ Error in extract_text_from_pdf: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         return None
 
@@ -226,103 +292,93 @@ def upload_to_s3(file_content, doc_id, content_type):
         print(f"Error uploading to S3: {str(e)}")
         return None
 
-def process_single_document(doc, documents_dir, index, state):
+def process_single_document(doc, access_token, checkpoint):
     """Process a single document and upload to Pinecone"""
     doc_id = doc['id']
     
-    # Enhanced logging
+    print(f"\n{'='*80}")
     print(f"🔍 Processing document: {doc_id}")
     print(f"Document Details:")
+    print(f"  - Type: {doc.get('type', 'Unknown')}")
     print(f"  - Created: {doc.get('created', 'N/A')}")
+    print(f"  - Modified: {doc.get('modified', 'N/A')}")
     print(f"  - Category: {doc.get('category', 'Uncategorized')}")
     print(f"  - Total: ${doc.get('total', 0.0)}")
-    
-    # Check if already processed
-    if doc_id in state.processed_docs:
-        print(f"⏩ Document {doc_id} already processed, skipping...")
-        return True
+    print(f"  - Processing State: {doc.get('processingState', 'Unknown')}")
+    print(f"{'='*80}\n")
     
     try:
-        # Get document attachment
-        attachment = doc.get('attachment', {})
-        if not attachment:
-            print(f"❌ No attachment found for document {doc_id}")
-            return False
-            
-        print(f"📥 Downloading document from: {attachment.get('url', 'Unknown URL')}")
-        
         # Download document
-        headers = {'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY")}'}
-        response = requests.get(attachment['url'], headers=headers)
-        if response.status_code != 200:
-            print(f"❌ Failed to download document: HTTP {response.status_code}")
+        print(f"📥 Downloading document...")
+        pdf_data = download_document(doc, access_token)
+        if not pdf_data:
+            print("❌ Failed to download document")
+            checkpoint.mark_failed(doc_id, "Download failed")
             return False
-            
-        # Upload to S3
-        print("☁️ Uploading document to S3...")
-        s3_url = upload_to_s3(
-            response.content,
-            doc_id,
-            attachment.get('type', 'application/pdf')
-        )
+        print(f"✅ Successfully downloaded {len(pdf_data):,} bytes")
         
-        if not s3_url:
-            print(f"❌ Failed to upload document {doc_id} to S3")
-            return False
-        
-        print(f"✅ Uploaded to S3: {s3_url}")
-        
-        # Extract text using GPT-4 Vision
-        print("🔤 Extracting text with GPT-4 Vision...")
-        text = extract_text_from_pdf(doc, os.getenv('OPENAI_API_KEY'))
-        
+        # Extract text
+        print("\n🔤 Extracting text with GPT-4o Vision...")
+        text = extract_text_from_pdf(doc, access_token)
         if not text:
-            print(f"❌ No text could be extracted from document {doc_id}")
+            print("❌ Failed to extract text")
+            checkpoint.mark_failed(doc_id, "Text extraction failed")
             return False
-        
-        print(f"📝 Extracted text length: {len(text)} characters")
+        print(f"✅ Successfully extracted {len(text):,} characters")
+        print(f"📝 Sample text: {text[:200]}...")
         
         # Create embedding
-        print("🧩 Creating vector embedding...")
+        print("\n🧮 Creating vector embedding...")
         embedding = create_embedding(text)
         if not embedding:
-            print(f"❌ Failed to create embedding for document {doc_id}")
+            print("❌ Failed to create embedding")
+            checkpoint.mark_failed(doc_id, "Embedding creation failed")
             return False
+        print(f"✅ Created embedding vector of length {len(embedding)}")
         
-        print(f"📊 Embedding vector length: {len(embedding)}")
-        
-        # Prepare metadata with S3 reference
+        # Prepare metadata
+        print("\n📋 Preparing metadata...")
         metadata = {
             'id': str(doc_id),
+            'type': doc.get('type', 'unknown'),
             'created': str(doc.get('created', '')),
             'modified': str(doc.get('modified', '')),
             'category': str(doc.get('category', 'Uncategorized')),
             'total': float(doc.get('total', 0.0)) if doc.get('total') is not None else 0.0,
-            'tax': float(doc.get('tax', 0.0)) if doc.get('tax') is not None else 0.0,
-            'text': text[:3000],  # Store more text for better context
-            'processed_date': datetime.now().isoformat(),
-            's3_url': s3_url  # Add S3 reference
+            'text': text[:3000],  # Store first 3000 chars for context
+            'processed_date': datetime.now().isoformat()
         }
+        print("✅ Metadata prepared")
+        
+        # Initialize Pinecone
+        print("\n🔄 Connecting to Pinecone...")
+        index = init_pinecone()
+        if not index:
+            print("❌ Failed to initialize Pinecone")
+            checkpoint.mark_failed(doc_id, "Pinecone initialization failed")
+            return False
         
         # Upsert to Pinecone
-        print("🔢 Upserting to Pinecone vector database...")
+        print("📤 Upserting to Pinecone...")
         try:
             index.upsert(vectors=[(str(doc_id), embedding, metadata)])
-            print(f"✅ Successfully processed and indexed document {doc_id}")
+            print("✅ Successfully upserted to Pinecone")
         except Exception as e:
-            print(f"❌ Error upserting to Pinecone: {str(e)}")
+            print(f"❌ Failed to upsert to Pinecone: {str(e)}")
+            checkpoint.mark_failed(doc_id, f"Pinecone upsert failed: {str(e)}")
             return False
         
         # Mark as processed
-        state.mark_processed(doc_id)
-        state.save_progress()
-        
-        print(f"🏁 Document {doc_id} processing complete!")
+        checkpoint.mark_processed(doc_id)
+        print(f"\n✅ Document {doc_id} successfully processed!")
+        print(f"{'='*80}")
         return True
-    
+        
     except Exception as e:
-        print(f"❌ Unexpected error processing document {doc_id}: {str(e)}")
+        error_msg = f"Error processing document: {str(e)}"
+        print(f"\n❌ {error_msg}")
         print(f"Traceback: {traceback.format_exc()}")
+        checkpoint.mark_failed(doc_id, error_msg)
         return False
 
 def main():
@@ -391,7 +447,7 @@ def main():
                 break
             
             print(f"\nProcessing document {i+1} of {len(documents_to_process)} (ID: {doc['id']})")
-            if process_single_document(doc, os.path.dirname(cache_file), index, state):
+            if process_single_document(doc, os.getenv('SHOEBOXED_ACCESS_TOKEN'), state):
                 pbar.update(1)
             
             time.sleep(1)  # Rate limiting between documents

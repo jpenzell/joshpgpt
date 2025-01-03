@@ -834,50 +834,29 @@ def process_documents():
         # Record start time
         start_time = time.time()
         
-        # Load tokens
+        # Load tokens and ensure we have access token
         print("\n🔑 DEBUG: Loading tokens...", flush=True)
         tokens = load_tokens()
+        if not tokens or 'access_token' not in tokens:
+            st.error("No valid Shoeboxed access token found. Please authenticate first.")
+            return
+            
+        # Store access token in environment for other functions to use
+        os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
+        
+        # Refresh token if needed
         tokens = refresh_if_needed(tokens)
+        if not tokens:
+            st.error("Failed to refresh token. Please authenticate again.")
+            return
+            
+        # Update access token in environment after refresh
+        os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
         # Get organization ID
         print("\n🏢 DEBUG: Getting organization ID...", flush=True)
         account_id = get_organization_id(tokens['access_token'])
         print(f"   Organization ID: {account_id}", flush=True)
-        
-        # Retrieve only unprocessed document IDs
-        print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
-        all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
-        total_documents = len(all_document_ids)
-        print(f"   Found {total_documents} documents", flush=True)
-        
-        if total_documents == 0:
-            print("✅ No new documents to process!")
-            st.success("All documents have been processed!")
-            return
-        
-        print(f"\n📊 Processing Summary:")
-        print(f"{'='*80}")
-        print(f"Total Documents to Process: {total_documents:,}")
-        print(f"Already Processed: {len(checkpoint.processed_docs):,}")
-        print(f"Previously Failed: {len(checkpoint.failed_docs):,}")
-        print(f"Previously Skipped: {len(checkpoint.skipped_docs):,}")
-        print(f"{'='*80}\n")
-        
-        # Initialize Pinecone
-        print("\n🔄 Initializing Pinecone vector database...")
-        index = init_pinecone()
-        
-        # Create documents directory
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        documents_dir = f'documents_{timestamp}'
-        os.makedirs(documents_dir, exist_ok=True)
-        
-        # Initialize progress metrics
-        processed_count = len(checkpoint.processed_docs)
-        failed_count = len(checkpoint.failed_docs)
-        skipped_count = len(checkpoint.skipped_docs)
-        batch_size = 10
-        total_batches = (total_documents + batch_size - 1) // batch_size
         
         # Create progress indicators
         progress_bar = st.progress(0)
@@ -888,90 +867,112 @@ def process_documents():
         failed_metric = metrics_cols[2].empty()
         skipped_metric = metrics_cols[3].empty()
         
+        # Initialize counters
+        processed_count = len(checkpoint.processed_docs)
+        failed_count = len(checkpoint.failed_docs)
+        skipped_count = len(checkpoint.skipped_docs)
+        
         # Update initial metrics
-        total_metric.metric("Total Documents", total_documents)
+        total_metric.metric("Total Documents", "Loading...")
         processed_metric.metric("Processed", processed_count)
         failed_metric.metric("Failed", failed_count)
         skipped_metric.metric("Skipped", skipped_count)
         
+        # Retrieve document IDs
+        print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
+        all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
+        total_documents = len(all_document_ids)
+        
+        # Update total metric now that we have the count
+        total_metric.metric("Total Documents", total_documents)
+        
+        if total_documents == 0:
+            print("✅ No new documents to process!")
+            st.success("All documents have been processed!")
+            return
+        
+        print(f"\n📊 Processing Summary:")
+        print(f"{'='*80}")
+        print(f"Total Documents to Process: {total_documents:,}")
+        print(f"Already Processed: {processed_count:,}")
+        print(f"Previously Failed: {failed_count:,}")
+        print(f"Previously Skipped: {skipped_count:,}")
+        print(f"{'='*80}\n")
+        
         # Process documents in batches
+        batch_size = 10
+        total_batches = (total_documents + batch_size - 1) // batch_size
+        
         for batch_index in range(total_batches):
             start_idx = batch_index * batch_size
             end_idx = min(start_idx + batch_size, total_documents)
             current_batch = all_document_ids[start_idx:end_idx]
             
-            # Update progress display
+            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
+            print(f"   Documents {start_idx + 1} to {end_idx} of {total_documents}")
+            
+            # Update progress
             progress = (batch_index + 1) / total_batches
             progress_bar.progress(progress)
             status_text.text(f"Processing batch {batch_index + 1} of {total_batches}")
             
-            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
-            
             # Process each document in the batch
             for doc_id in current_batch:
                 try:
+                    print(f"\n📄 Processing document {doc_id}")
+                    
                     # Skip if already processed
                     if not checkpoint.should_process_doc(doc_id):
                         print(f"⏭️ Skipping already processed document {doc_id}")
                         skipped_count += 1
+                        skipped_metric.metric("Skipped", skipped_count)
                         continue
                     
                     # Get document details
-                    print(f"\n📄 Processing document {doc_id}")
                     doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
                     response = requests.get(doc_url, headers=get_shoeboxed_headers(tokens['access_token']))
                     
                     if response.status_code != 200:
                         print(f"❌ Failed to get document details. Status: {response.status_code}")
-                        checkpoint.mark_failed(doc_id)
+                        checkpoint.mark_failed(doc_id, f"HTTP {response.status_code}")
                         failed_count += 1
+                        failed_metric.metric("Failed", failed_count)
                         continue
                     
                     doc_data = response.json()
                     
-                    # Download and process the document
-                    pdf_data = download_document(doc_data, tokens['access_token'])
-                    if pdf_data is None:
-                        print("❌ Failed to download document")
-                        checkpoint.mark_failed(doc_id)
+                    # Process the document
+                    if process_single_document(doc_data, tokens['access_token'], checkpoint):
+                        processed_count += 1
+                        processed_metric.metric("Processed", processed_count)
+                        print(f"✅ Successfully processed document {doc_id}")
+                    else:
                         failed_count += 1
-                        continue
+                        failed_metric.metric("Failed", failed_count)
+                        print(f"❌ Failed to process document {doc_id}")
                     
-                    # Extract text from PDF
-                    extracted_text = extract_text_with_gpt4o(pdf_data)
-                    if not extracted_text:
-                        print("❌ Failed to extract text")
-                        checkpoint.mark_failed(doc_id)
-                        failed_count += 1
-                        continue
-                    
-                    # Create document metadata
-                    metadata = create_document_metadata(doc_data, extracted_text)
-                    
-                    # Generate embeddings and store in Pinecone
-                    store_in_pinecone(index, doc_id, extracted_text, metadata)
-                    
-                    # Mark as processed and update counts
-                    checkpoint.mark_processed(doc_id)
-                    processed_count += 1
-                    
-                    # Update metrics display
+                    # Update metrics
                     total_metric.metric("Total Documents", total_documents)
                     processed_metric.metric("Processed", processed_count)
                     failed_metric.metric("Failed", failed_count)
                     skipped_metric.metric("Skipped", skipped_count)
                     
-                    # Save progress after each document
-                    checkpoint.save_checkpoint()
-                    
                 except Exception as e:
                     print(f"❌ Error processing document {doc_id}: {str(e)}")
-                    checkpoint.mark_failed(doc_id)
+                    checkpoint.mark_failed(doc_id, str(e))
                     failed_count += 1
-                    checkpoint.save()
+                    failed_metric.metric("Failed", failed_count)
+                    continue
+            
+            # Save checkpoint after each batch
+            checkpoint.update_batch(batch_index)
+            checkpoint.save_checkpoint()
             
             # Refresh token if needed after each batch
             tokens = refresh_if_needed(tokens)
+            if not tokens:
+                st.error("Failed to refresh token. Please authenticate again.")
+                return
         
         # Final progress update
         progress_bar.progress(1.0)
@@ -989,9 +990,11 @@ def process_documents():
         print(f"   Processed: {processed_count}")
         print(f"   Failed: {failed_count}")
         print(f"   Skipped: {skipped_count}")
+        print(f"   Time taken: {time.time() - start_time:.2f} seconds")
         
     except Exception as e:
         print(f"❌ Error in document processing: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         st.error(f"An error occurred during processing: {str(e)}")
         raise
 
