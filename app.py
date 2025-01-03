@@ -621,7 +621,15 @@ def process_single_document(doc_details, tokens, state):
         print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}", flush=True)
         print(f"  Upload Date: {doc_details.get('uploaded')}", flush=True)
         print(f"  Total Amount: ${doc_details.get('total', 'N/A')}", flush=True)
-        print(f"  Categories: {', '.join(doc_details.get('categories', ['None']))}", flush=True)
+        
+        # Fix categories handling
+        categories = doc_details.get('categories')
+        if isinstance(categories, list):
+            categories_str = ', '.join(categories) or 'None'
+        else:
+            categories_str = str(categories) if categories else 'None'
+        print(f"  Categories: {categories_str}", flush=True)
+        
         print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}", flush=True)
         if doc_id in state.failed_docs:
             print(f"  Previous Failure: {state.failure_reasons.get(doc_id, 'Unknown reason')}", flush=True)
