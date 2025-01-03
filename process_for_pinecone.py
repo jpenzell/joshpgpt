@@ -295,6 +295,7 @@ def upload_to_s3(file_content, doc_id, content_type):
 def process_single_document(doc, access_token, checkpoint):
     """Process a single document and upload to Pinecone"""
     doc_id = doc['id']
+    temp_files = []  # Track files to cleanup
     
     print(f"\n{'='*80}")
     print(f"🔍 Processing document: {doc_id}")
@@ -308,16 +309,25 @@ def process_single_document(doc, access_token, checkpoint):
     print(f"{'='*80}\n")
     
     try:
-        # Download document
+        # 1. Download document
         print(f"📥 Downloading document...")
         pdf_data = download_document(doc, access_token)
         if not pdf_data:
             print("❌ Failed to download document")
             checkpoint.mark_failed(doc_id, "Download failed")
             return False
-        print(f"✅ Successfully downloaded {len(pdf_data):,} bytes")
+            
+        # Save temporarily
+        os.makedirs('documents', exist_ok=True)
+        temp_pdf_path = os.path.join('documents', f"{doc_id}.pdf")
+        temp_files.append(temp_pdf_path)  # Track for cleanup
         
-        # Extract text
+        with open(temp_pdf_path, 'wb') as f:
+            f.write(pdf_data)
+        print(f"✅ Successfully downloaded {len(pdf_data):,} bytes")
+        print(f"💾 Saved temporarily to: {temp_pdf_path}")
+        
+        # 2. Extract text
         print("\n🔤 Extracting text with GPT-4o Vision...")
         text = extract_text_from_pdf(doc, access_token)
         if not text:
@@ -327,7 +337,7 @@ def process_single_document(doc, access_token, checkpoint):
         print(f"✅ Successfully extracted {len(text):,} characters")
         print(f"📝 Sample text: {text[:200]}...")
         
-        # Create embedding
+        # 3. Create embedding
         print("\n🧮 Creating vector embedding...")
         embedding = create_embedding(text)
         if not embedding:
@@ -336,7 +346,7 @@ def process_single_document(doc, access_token, checkpoint):
             return False
         print(f"✅ Created embedding vector of length {len(embedding)}")
         
-        # Prepare metadata
+        # 4. Prepare metadata and upload to Pinecone
         print("\n📋 Preparing metadata...")
         metadata = {
             'id': str(doc_id),
@@ -358,7 +368,7 @@ def process_single_document(doc, access_token, checkpoint):
             checkpoint.mark_failed(doc_id, "Pinecone initialization failed")
             return False
         
-        # Upsert to Pinecone
+        # Upload to Pinecone
         print("📤 Upserting to Pinecone...")
         try:
             index.upsert(vectors=[(str(doc_id), embedding, metadata)])
@@ -367,8 +377,43 @@ def process_single_document(doc, access_token, checkpoint):
             print(f"❌ Failed to upsert to Pinecone: {str(e)}")
             checkpoint.mark_failed(doc_id, f"Pinecone upsert failed: {str(e)}")
             return False
+            
+        # 5. Upload to S3
+        print("\n☁️ Uploading to S3...")
+        s3_url = upload_to_s3(pdf_data, doc_id, 'application/pdf')
+        if not s3_url:
+            print("❌ Failed to upload to S3")
+            checkpoint.mark_failed(doc_id, "S3 upload failed")
+            return False
+        print(f"✅ Successfully uploaded to S3: {s3_url}")
         
-        # Mark as processed
+        # Update metadata with S3 URL
+        try:
+            metadata['s3_url'] = s3_url
+            index.upsert(vectors=[(str(doc_id), embedding, metadata)])
+            print("✅ Updated Pinecone with S3 URL")
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to update Pinecone with S3 URL: {str(e)}")
+            # Don't fail the process for this
+        
+        # 6. Cleanup temporary files
+        print("\n🧹 Cleaning up temporary files...")
+        cleanup_success = True
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    print(f"✅ Deleted: {temp_file}")
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to delete {temp_file}: {str(e)}")
+                cleanup_success = False
+        
+        if cleanup_success:
+            print("✅ All temporary files cleaned up")
+        else:
+            print("⚠️ Some files could not be deleted")
+        
+        # 7. Mark as processed and save state
         checkpoint.mark_processed(doc_id)
         print(f"\n✅ Document {doc_id} successfully processed!")
         print(f"{'='*80}")
@@ -380,6 +425,17 @@ def process_single_document(doc, access_token, checkpoint):
         print(f"Traceback: {traceback.format_exc()}")
         checkpoint.mark_failed(doc_id, error_msg)
         return False
+        
+    finally:
+        # Ensure cleanup happens even if there's an error
+        print("\n🧹 Final cleanup...")
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    print(f"✅ Deleted: {temp_file}")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not delete {temp_file}: {str(e)}")
 
 def main():
     global should_continue
