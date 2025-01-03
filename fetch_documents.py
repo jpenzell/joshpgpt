@@ -4,14 +4,32 @@ import os
 from datetime import datetime
 import time
 import traceback
+from pathlib import Path
+
+# Constants for file paths
+DATA_DIR = Path('data')
+TOKENS_FILE = DATA_DIR / '.auth_success'
+PROGRESS_FILE = DATA_DIR / 'fetch_progress.json'
+DOCUMENTS_DIR = DATA_DIR / 'documents'
+IMAGES_DIR = DATA_DIR / 'images'
+
+def ensure_directories():
+    """Ensure all required directories exist"""
+    DATA_DIR.mkdir(exist_ok=True)
+    DOCUMENTS_DIR.mkdir(exist_ok=True)
+    IMAGES_DIR.mkdir(exist_ok=True)
 
 def load_tokens():
     """Load tokens from file"""
     try:
-        with open('tokens.json', 'r') as f:
+        if not TOKENS_FILE.exists():
+            raise FileNotFoundError("No tokens found. Please run auth_flow.py first.")
+        
+        with TOKENS_FILE.open('r') as f:
             return json.load(f)
-    except FileNotFoundError:
-        raise Exception("No tokens found. Please run auth_flow.py first.")
+    except Exception as e:
+        print(f"Error loading tokens: {str(e)}")
+        raise
 
 def refresh_if_needed(tokens):
     """Check if token needs refresh and refresh if necessary"""
@@ -71,26 +89,30 @@ def get_organization_id(access_token):
 
 def load_progress():
     """Load the current progress of document fetching"""
-    progress_file = 'fetch_progress.json'
     try:
-        with open(progress_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            'last_offset': 0,
-            'processed_document_ids': set(),
-            'total_documents_processed': 0
-        }
+        if PROGRESS_FILE.exists():
+            with PROGRESS_FILE.open('r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading progress: {str(e)}")
+    
+    return {
+        'last_offset': 0,
+        'processed_document_ids': set(),
+        'total_documents_processed': 0
+    }
 
 def save_progress(progress):
     """Save the current progress of document fetching"""
-    progress_file = 'fetch_progress.json'
-    # Convert set to list for JSON serialization
-    if isinstance(progress.get('processed_document_ids'), set):
-        progress['processed_document_ids'] = list(progress['processed_document_ids'])
-    
-    with open(progress_file, 'w') as f:
-        json.dump(progress, f, indent=2)
+    try:
+        # Convert set to list for JSON serialization
+        if isinstance(progress.get('processed_document_ids'), set):
+            progress['processed_document_ids'] = list(progress['processed_document_ids'])
+        
+        with PROGRESS_FILE.open('w') as f:
+            json.dump(progress, f, indent=2)
+    except Exception as e:
+        print(f"Error saving progress: {str(e)}")
 
 def fetch_documents(access_token, modified_since=None):
     """Enhanced fetch_documents with resumability"""
@@ -172,28 +194,32 @@ def fetch_documents(access_token, modified_since=None):
 
 def save_documents_and_images(documents, access_token):
     """Enhanced save method with progress tracking"""
-    # Create base directories
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_dir = f'documents_{timestamp}'
-    os.makedirs(base_dir, exist_ok=True)
-    os.makedirs(f'{base_dir}/images', exist_ok=True)
+    ensure_directories()
     
     # Save metadata
-    metadata_file = f'{base_dir}/metadata.json'
-    with open(metadata_file, 'w') as f:
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    batch_dir = DOCUMENTS_DIR / f'batch_{timestamp}'
+    batch_dir.mkdir(exist_ok=True)
+    
+    metadata_file = batch_dir / 'metadata.json'
+    with metadata_file.open('w') as f:
         json.dump(documents, f, indent=2)
     
     print(f"Saved metadata for {len(documents)} documents to {metadata_file}")
     
     # Download images with progress tracking
     total_images = 0
-    image_progress_file = f'{base_dir}/image_download_progress.json'
+    image_progress_file = batch_dir / 'image_download_progress.json'
     
     # Load existing image download progress if it exists
     try:
-        with open(image_progress_file, 'r') as f:
-            image_progress = json.load(f)
-    except FileNotFoundError:
+        if image_progress_file.exists():
+            with image_progress_file.open('r') as f:
+                image_progress = json.load(f)
+        else:
+            image_progress = {'downloaded_doc_ids': []}
+    except Exception as e:
+        print(f"Error loading image progress: {str(e)}")
         image_progress = {'downloaded_doc_ids': []}
     
     for doc in documents:
@@ -206,18 +232,19 @@ def save_documents_and_images(documents, access_token):
             image_url = doc['attachment'].get('pdf', doc['attachment'].get('original'))
             if image_url:
                 file_extension = 'pdf' if 'pdf' in doc['attachment'] else image_url.split('.')[-1]
-                image_filename = f"{base_dir}/images/{doc['id']}.{file_extension}"
+                image_path = batch_dir / 'images' / f"{doc['id']}.{file_extension}"
+                image_path.parent.mkdir(exist_ok=True)
                 
                 print(f"Downloading image for document {doc['id']}...")
-                if download_image(image_url, access_token, image_filename):
+                if download_image(image_url, access_token, str(image_path)):
                     total_images += 1
                     image_progress['downloaded_doc_ids'].append(doc['id'])
                     
                     # Save image download progress after each successful download
-                    with open(image_progress_file, 'w') as f:
+                    with image_progress_file.open('w') as f:
                         json.dump(image_progress, f, indent=2)
                     
-                    print(f"Successfully downloaded image to {image_filename}")
+                    print(f"Successfully downloaded image to {image_path}")
                 else:
                     print(f"Failed to download image for document {doc['id']}")
                 
@@ -226,7 +253,7 @@ def save_documents_and_images(documents, access_token):
     print(f"\nDownload complete!")
     print(f"Total documents: {len(documents)}")
     print(f"Total images downloaded: {total_images}")
-    print(f"All files saved in directory: {base_dir}")
+    print(f"All files saved in directory: {batch_dir}")
 
 def main():
     # Load tokens

@@ -45,23 +45,58 @@ def load_tokens():
     """Load tokens from file"""
     try:
         with open('.auth_success', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        raise Exception("No tokens found. Please authenticate first.")
+            tokens = json.load(f)
+            if not tokens.get('access_token'):
+                raise Exception("Invalid token data")
+            return tokens
+    except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
+        print(f"Error loading tokens: {str(e)}")
+        return None
 
 def refresh_if_needed(tokens):
     """Check if token needs refresh and refresh if necessary"""
+    if not tokens:
+        return None
+        
     try:
         expires_at = datetime.fromisoformat(tokens.get('expires_at', datetime.now().isoformat()))
         if datetime.now() >= expires_at:
-            # Implement token refresh logic here
-            # For now, we'll just re-authenticate
-            print("Token expired. Please re-authenticate.")
-            return tokens
+            # Implement token refresh
+            refresh_token = tokens.get('refresh_token')
+            if not refresh_token:
+                return None
+                
+            response = requests.post(
+                os.getenv('SHOEBOXED_TOKEN_URL'),
+                data={
+                    'grant_type': 'refresh_token',
+                    'refresh_token': refresh_token,
+                    'client_id': os.getenv('SHOEBOXED_CLIENT_ID'),
+                    'client_secret': os.getenv('SHOEBOXED_CLIENT_SECRET')
+                }
+            )
+            
+            if response.status_code == 200:
+                new_tokens = response.json()
+                # Update expiration
+                new_tokens['expires_at'] = (
+                    datetime.now() + 
+                    timedelta(seconds=new_tokens.get('expires_in', 3600))
+                ).isoformat()
+                
+                # Save new tokens
+                with open('.auth_success', 'w') as f:
+                    json.dump(new_tokens, f)
+                    
+                return new_tokens
+            else:
+                print(f"Token refresh failed: {response.status_code}")
+                return None
+                
         return tokens
     except Exception as e:
-        print(f"Error checking token expiration: {str(e)}")
-        return tokens
+        print(f"Error refreshing token: {str(e)}")
+        return None
 
 def init_session_state():
     """Initialize session state variables"""
@@ -160,7 +195,7 @@ def extract_text_with_gpt4o(pdf_bytes):
                 
                 # Call GPT-4o
                 response = client.chat.completions.create(
-                    model=os.getenv('OPENAI_VISION_MODEL', "gpt-4-vision-preview"),
+                    model=os.getenv('OPENAI_VISION_MODEL', 'gpt-4o'),
                     messages=[
                         {
                             "role": "user",
@@ -181,9 +216,9 @@ def extract_text_with_gpt4o(pdf_bytes):
                     ],
                     max_tokens=4096,
                     temperature=0.2,
-                    top_p=0.1,  # More focused response
-                    frequency_penalty=0.1,  # Reduce repetition
-                    presence_penalty=0.1    # Encourage novel information
+                    top_p=0.1,
+                    frequency_penalty=0.1,
+                    presence_penalty=0.1
                 )
                 
                 page_text = response.choices[0].message.content

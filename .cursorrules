@@ -1,0 +1,25 @@
+# Guide for Implementing GPT-4o for Data Extraction and Pinecone Embedding
+
+## Extract Text from PDFs Using GPT-4o
+
+1. Convert PDF pages to images.
+2. Encode images to base64.
+3. Send images to GPT-4o for text extraction.
+
+## Generate Embeddings for the Extracted Text
+
+1. Select an appropriate embedding model.
+2. Generate embeddings using the OpenAI API.
+
+## Store Embeddings in Pinecone
+
+1. Initialize Pinecone with your API key.
+2. Create a new index with the appropriate dimensionality.
+3. Upsert the embeddings into the Pinecone index.
+
+## Querying Pinecone
+
+1. Generate an embedding for your query.
+2. Use Pinecone to retrieve relevant documents.
+
+*Note: Ensure compliance with data privacy regulations and stay informed about updates to OpenAI's models and Pinecone's features.*

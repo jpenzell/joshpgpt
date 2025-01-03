@@ -29,8 +29,78 @@ load_dotenv()
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
+def retry_with_backoff(func, max_retries=3, initial_delay=1):
+    """Retry a function with exponential backoff"""
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        last_exception = None
+        
+        for retry in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                if retry < max_retries - 1:
+                    print(f"Attempt {retry + 1} failed: {str(e)}")
+                    print(f"Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    delay *= 2
+        
+        print(f"All {max_retries} attempts failed. Last error: {str(last_exception)}")
+        raise last_exception
+    
+    return wrapper
+
+@retry_with_backoff
+def create_embedding(text):
+    """Create embedding for text using OpenAI with retry logic"""
+    try:
+        response = client.embeddings.create(
+            model=os.getenv('OPENAI_EMBEDDING_MODEL'),
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error creating embedding: {str(e)}")
+        raise
+
+@retry_with_backoff
+def extract_text_with_vision(image_base64):
+    """Extract text using GPT-4o Vision with retry logic"""
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_VISION_MODEL', 'gpt-4o'),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this document comprehensively. Include numbers, dates, and key details. Provide a structured, clear extraction."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096,
+            temperature=0.2,
+            top_p=0.1,
+            frequency_penalty=0.1,
+            presence_penalty=0.1
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error in GPT-4o Vision API call: {str(e)}")
+        raise
+
 def extract_text_from_pdf(doc, access_token):
-    """Extract text from PDF using GPT-4 Vision"""
+    """Extract text from PDF using GPT-4 Vision with improved error handling"""
     try:
         # Get document attachment
         attachment = doc.get('attachment', {})
@@ -38,21 +108,24 @@ def extract_text_from_pdf(doc, access_token):
             print(f"No attachment found for document {doc['id']}")
             return None
         
-        # Download PDF
-        headers = {'Authorization': f'Bearer {access_token}'}
-        response = requests.get(attachment['url'], headers=headers)
-        if response.status_code != 200:
-            print(f"Failed to download PDF: {response.status_code}")
-            return None
+        # Download PDF with retry
+        @retry_with_backoff
+        def download_pdf():
+            headers = {'Authorization': f'Bearer {access_token}'}
+            response = requests.get(attachment['url'], headers=headers)
+            response.raise_for_status()
+            return response.content
+            
+        pdf_content = download_pdf()
         
         # Convert PDF to images
         try:
-            pdf_bytes = BytesIO(response.content)
+            pdf_bytes = BytesIO(pdf_content)
             images = convert_from_bytes(pdf_bytes.read())
         except Exception as e:
             print(f"Error converting PDF to images: {str(e)}")
             # If conversion fails, try processing as image directly
-            images = [response.content]
+            images = [pdf_content]
         
         # Process each page/image
         extracted_text = []
@@ -61,41 +134,17 @@ def extract_text_from_pdf(doc, access_token):
                 # Convert image to base64
                 buffered = BytesIO()
                 if isinstance(image, bytes):
-                    # If image is already bytes, use directly
                     image_bytes = image
                 else:
-                    # If image is PIL Image, convert to bytes
-                    image.save(buffered, format="JPEG")
+                    image.save(buffered, format="JPEG", quality=95)
                     image_bytes = buffered.getvalue()
                 
                 image_base64 = base64.b64encode(image_bytes).decode('utf-8')
                 
-                # Extract text using GPT-4 Vision
-                response = client.chat.completions.create(
-                    model=os.getenv('OPENAI_VISION_MODEL'),
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Please extract all text from this receipt or document image. Include all numbers, dates, and details. Format it clearly."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_base64}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=1500
-                )
-                
-                page_text = response.choices[0].message.content
+                # Extract text using GPT-4 Vision with retry
+                page_text = extract_text_with_vision(image_base64)
                 if page_text:
-                    extracted_text.append(page_text)
+                    extracted_text.append(f"Page {i + 1}:\n{page_text}")
                 
             except Exception as e:
                 print(f"Error processing page {i}: {str(e)}")
@@ -106,18 +155,6 @@ def extract_text_from_pdf(doc, access_token):
     except Exception as e:
         print(f"Error in extract_text_from_pdf: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
-        return None
-
-def create_embedding(text):
-    """Create embedding for text using OpenAI"""
-    try:
-        response = client.embeddings.create(
-            model=os.getenv('OPENAI_EMBEDDING_MODEL'),
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"Error creating embedding: {str(e)}")
         return None
 
 class ProcessingState:
