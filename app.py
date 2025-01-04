@@ -59,43 +59,81 @@ def refresh_if_needed(tokens):
         return None
         
     try:
+        # Add buffer time to refresh before expiration
+        REFRESH_BUFFER_MINUTES = 5
         expires_at = datetime.fromisoformat(tokens.get('expires_at', datetime.now().isoformat()))
-        if datetime.now() >= expires_at:
-            # Implement token refresh
-            refresh_token = tokens.get('refresh_token')
-            if not refresh_token:
-                return None
-                
-            response = requests.post(
-                os.getenv('SHOEBOXED_TOKEN_URL'),
-                data={
-                    'grant_type': 'refresh_token',
-                    'refresh_token': refresh_token,
-                    'client_id': os.getenv('SHOEBOXED_CLIENT_ID'),
-                    'client_secret': os.getenv('SHOEBOXED_CLIENT_SECRET')
-                }
-            )
+        
+        # Check if token will expire soon (within buffer time)
+        if datetime.now() + timedelta(minutes=REFRESH_BUFFER_MINUTES) >= expires_at:
+            print("\n🔄 Token needs refresh...")
             
-            if response.status_code == 200:
-                new_tokens = response.json()
-                # Update expiration
-                new_tokens['expires_at'] = (
-                    datetime.now() + 
-                    timedelta(seconds=new_tokens.get('expires_in', 3600))
-                ).isoformat()
-                
-                # Save new tokens
-                with open('.auth_success', 'w') as f:
-                    json.dump(new_tokens, f)
+            # Implement token refresh with retries
+            max_retries = 3
+            retry_delay = 5  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    refresh_token = tokens.get('refresh_token')
+                    if not refresh_token:
+                        print("❌ No refresh token available")
+                        return None
                     
-                return new_tokens
-            else:
-                print(f"Token refresh failed: {response.status_code}")
-                return None
-                
+                    print(f"Refresh attempt {attempt + 1}/{max_retries}")
+                    response = requests.post(
+                        os.getenv('SHOEBOXED_TOKEN_URL'),
+                        data={
+                            'grant_type': 'refresh_token',
+                            'refresh_token': refresh_token,
+                            'client_id': os.getenv('SHOEBOXED_CLIENT_ID'),
+                            'client_secret': os.getenv('SHOEBOXED_CLIENT_SECRET')
+                        },
+                        headers={
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'application/json'
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        new_tokens = response.json()
+                        # Update expiration with buffer
+                        new_tokens['expires_at'] = (
+                            datetime.now() + 
+                            timedelta(seconds=new_tokens.get('expires_in', 3600))
+                        ).isoformat()
+                        
+                        # Save new tokens
+                        with open('.auth_success', 'w') as f:
+                            json.dump(new_tokens, f)
+                        
+                        print("✅ Token refresh successful")
+                        return new_tokens
+                    else:
+                        print(f"⚠️ Token refresh failed (Attempt {attempt + 1}): Status {response.status_code}")
+                        print(f"Response: {response.text}")
+                        
+                        if attempt < max_retries - 1:
+                            print(f"Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            print("❌ All refresh attempts failed")
+                            return None
+                            
+                except Exception as e:
+                    print(f"⚠️ Error during refresh attempt {attempt + 1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        print(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print("❌ All refresh attempts failed")
+                        return None
+                        
         return tokens
+        
     except Exception as e:
-        print(f"Error refreshing token: {str(e)}")
+        print(f"❌ Error in refresh check: {str(e)}")
         return None
 
 def init_session_state():
@@ -830,10 +868,59 @@ class ProcessingCheckpoint:
         return doc_id not in self.processed_docs and \
                doc_id not in self.skipped_docs
 
+class ProcessingStats:
+    def __init__(self):
+        self.start_time = time.time()
+        self.processing_times = []  # List of processing times for each document
+        self.total_documents = 0
+        self.processed_count = 0
+        
+    def add_processing_time(self, duration):
+        """Add a new processing time and update averages"""
+        self.processing_times.append(duration)
+        # Keep only the last 20 times for rolling average
+        if len(self.processing_times) > 20:
+            self.processing_times.pop(0)
+    
+    def get_average_time(self):
+        """Get rolling average of processing times"""
+        if not self.processing_times:
+            return 0
+        return sum(self.processing_times) / len(self.processing_times)
+    
+    def get_estimated_completion_time(self, remaining_docs):
+        """Calculate estimated completion time based on rolling average"""
+        if not self.processing_times:
+            return "Calculating..."
+            
+        avg_time = self.get_average_time()
+        total_remaining_time = avg_time * remaining_docs
+        
+        # Convert to hours and minutes
+        hours = int(total_remaining_time // 3600)
+        minutes = int((total_remaining_time % 3600) // 60)
+        
+        if hours > 0:
+            return f"~{hours}h {minutes}m remaining"
+        else:
+            return f"~{minutes}m remaining"
+    
+    def get_processing_rate(self):
+        """Calculate current processing rate (docs per minute)"""
+        if not self.processing_times:
+            return 0
+        avg_time = self.get_average_time()
+        if avg_time == 0:
+            return 0
+        return 60 / avg_time  # Convert to docs per minute
+
 def process_documents():
     """Process documents from Shoeboxed in batches"""
     try:
         print("\n🔍 DEBUG: Starting document processing...", flush=True)
+        
+        # Initialize stats tracking
+        stats = ProcessingStats()
         
         # Initialize checkpoint system first
         checkpoint = ProcessingCheckpoint()
@@ -852,7 +939,7 @@ def process_documents():
         # Store access token in environment for other functions to use
         os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
-        # Refresh token if needed
+        # Add token refresh before starting main processing
         tokens = refresh_if_needed(tokens)
         if not tokens:
             st.error("Failed to refresh token. Please authenticate again.")
@@ -869,11 +956,12 @@ def process_documents():
         # Create progress indicators
         progress_bar = st.progress(0)
         status_text = st.empty()
-        metrics_cols = st.columns(4)
+        metrics_cols = st.columns(5)  # Added one more column for time estimate
         total_metric = metrics_cols[0].empty()
         processed_metric = metrics_cols[1].empty()
         failed_metric = metrics_cols[2].empty()
         skipped_metric = metrics_cols[3].empty()
+        time_metric = metrics_cols[4].empty()  # New metric for time estimate
         
         # Initialize counters
         processed_count = len(checkpoint.processed_docs)
@@ -885,11 +973,13 @@ def process_documents():
         processed_metric.metric("Processed", processed_count)
         failed_metric.metric("Failed", failed_count)
         skipped_metric.metric("Skipped", skipped_count)
+        time_metric.metric("Est. Time", "Calculating...")
         
         # Retrieve document IDs
         print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
         all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
+        stats.total_documents = total_documents
         
         # Update total metric now that we have the count
         total_metric.metric("Total Documents", total_documents)
@@ -912,6 +1002,15 @@ def process_documents():
         total_batches = (total_documents + batch_size - 1) // batch_size
         
         for batch_index in range(total_batches):
+            # Refresh token at the start of each batch
+            tokens = refresh_if_needed(tokens)
+            if not tokens:
+                st.error("Failed to refresh token. Please authenticate again.")
+                return
+            
+            # Update access token in environment
+            os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
+            
             start_idx = batch_index * batch_size
             end_idx = min(start_idx + batch_size, total_documents)
             current_batch = all_document_ids[start_idx:end_idx]
@@ -922,12 +1021,12 @@ def process_documents():
             # Update progress
             progress = (batch_index + 1) / total_batches
             progress_bar.progress(progress)
-            status_text.text(f"Processing batch {batch_index + 1} of {total_batches}")
             
             # Process each document in the batch
             for doc_id in current_batch:
                 try:
                     print(f"\n📄 Processing document {doc_id}")
+                    doc_start_time = time.time()
                     
                     # Skip if already processed
                     if not checkpoint.should_process_doc(doc_id):
@@ -935,6 +1034,15 @@ def process_documents():
                         skipped_count += 1
                         skipped_metric.metric("Skipped", skipped_count)
                         continue
+                    
+                    # Check token before each document
+                    tokens = refresh_if_needed(tokens)
+                    if not tokens:
+                        st.error("Failed to refresh token. Please authenticate again.")
+                        return
+                    
+                    # Update access token in environment
+                    os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
                     
                     # Get document details
                     doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
@@ -954,16 +1062,38 @@ def process_documents():
                         processed_count += 1
                         processed_metric.metric("Processed", processed_count)
                         print(f"✅ Successfully processed document {doc_id}")
+                        
+                        # Update processing stats
+                        doc_processing_time = time.time() - doc_start_time
+                        stats.add_processing_time(doc_processing_time)
+                        
+                        # Update time estimate
+                        remaining_docs = total_documents - processed_count - skipped_count
+                        time_estimate = stats.get_estimated_completion_time(remaining_docs)
+                        processing_rate = stats.get_processing_rate()
+                        time_metric.metric(
+                            "Est. Time",
+                            time_estimate,
+                            delta=f"{processing_rate:.1f} docs/min"
+                        )
                     else:
                         failed_count += 1
                         failed_metric.metric("Failed", failed_count)
                         print(f"❌ Failed to process document {doc_id}")
                     
-                    # Update metrics
+                    # Update all metrics
                     total_metric.metric("Total Documents", total_documents)
                     processed_metric.metric("Processed", processed_count)
                     failed_metric.metric("Failed", failed_count)
                     skipped_metric.metric("Skipped", skipped_count)
+                    
+                    # Update status text with current document and time estimate
+                    remaining_docs = total_documents - processed_count - skipped_count
+                    time_estimate = stats.get_estimated_completion_time(remaining_docs)
+                    status_text.text(
+                        f"Processing batch {batch_index + 1} of {total_batches} "
+                        f"({time_estimate})"
+                    )
                     
                 except Exception as e:
                     print(f"❌ Error processing document {doc_id}: {str(e)}")
@@ -975,12 +1105,6 @@ def process_documents():
             # Save checkpoint after each batch
             checkpoint.update_batch(batch_index)
             checkpoint.save_checkpoint()
-            
-            # Refresh token if needed after each batch
-            tokens = refresh_if_needed(tokens)
-            if not tokens:
-                st.error("Failed to refresh token. Please authenticate again.")
-                return
         
         # Final progress update
         progress_bar.progress(1.0)
@@ -991,6 +1115,7 @@ def process_documents():
         processed_metric.metric("Processed", processed_count)
         failed_metric.metric("Failed", failed_count)
         skipped_metric.metric("Skipped", skipped_count)
+        time_metric.metric("Total Time", f"{(time.time() - start_time) / 60:.1f}m")
         
         print("\n✅ Document processing complete!")
         print(f"📊 Final Statistics:")
