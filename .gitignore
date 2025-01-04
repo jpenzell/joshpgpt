@@ -1,3 +1,10 @@
+# Temporary and processed files
+documents/
+documents_*/
+processing_checkpoint.json
+document_id_cache.json
+retrieval_metadata.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -31,16 +38,7 @@ ENV/
 *.swp
 *.swo
 
-# Project specific
-.env
-.auth_success
-processing_progress.json
-document_list_cache.json
-documents_*/
-temp_attachments/
-*.log
-
-# OS specific
+# OS
 .DS_Store
 .DS_Store?
 ._*
@@ -48,3 +46,7 @@ temp_attachments/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Auth and Environment
+.env
+.auth_success
