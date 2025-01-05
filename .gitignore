@@ -50,3 +50,9 @@ Thumbs.db
 # Auth and Environment
 .env
 .auth_success
+*.log
+temp_attachments/
+document_list_cache.json
+document_id_cache.json
+retrieval_metadata.json
+processing_checkpoint.json

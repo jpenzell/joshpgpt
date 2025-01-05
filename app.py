@@ -22,6 +22,7 @@ from process_for_pinecone import extract_text_from_pdf, create_embedding, Proces
 import logging
 import boto3
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
@@ -219,54 +220,14 @@ def extract_text_with_gpt4o(pdf_bytes):
             logging.error(f"Traceback: {traceback.format_exc()}")
             return None
         
-        # Process first page (or all pages if needed)
+        # Process pages concurrently
         image_texts = []
-        for i, image in enumerate(images):
-            try:
-                # Convert image to bytes
-                buffered = BytesIO()
-                image.save(buffered, format="PNG")
-                image_bytes = buffered.getvalue()
-                
-                # Base64 encode the image
-                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-                
-                # Call GPT-4o
-                response = client.chat.completions.create(
-                    model=os.getenv('OPENAI_VISION_MODEL', 'gpt-4o'),
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Extract all text from this document comprehensively. Include numbers, dates, and key details. Provide a structured, clear extraction."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{image_base64}",
-                                        "detail": "high"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=4096,
-                    temperature=0.2,
-                    top_p=0.1,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1
-                )
-                
-                page_text = response.choices[0].message.content
+        with ThreadPoolExecutor() as executor:
+            future_to_page = {executor.submit(process_page, i, image): i for i, image in enumerate(images)}
+            for future in as_completed(future_to_page):
+                page_text = future.result()
                 if page_text:
-                    image_texts.append(f"Page {i+1}:\n{page_text}")
-                
-            except Exception as e:
-                logging.error(f"Error processing page {i}: {str(e)}")
-                logging.error(f"Traceback: {traceback.format_exc()}")
-                continue
+                    image_texts.append(page_text)
         
         # Combine texts from all pages
         return "\n\n".join(image_texts) if image_texts else None
@@ -275,6 +236,93 @@ def extract_text_with_gpt4o(pdf_bytes):
         logging.error(f"Error in GPT-4o document text extraction: {str(e)}")
         logging.error(f"Traceback: {traceback.format_exc()}")
         return None
+
+def process_page(i, image):
+    """Process a single page image and extract text"""
+    try:
+        # Convert image to bytes
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        image_bytes = buffered.getvalue()
+        
+        # Base64 encode the image
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # Call GPT-4o
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_VISION_MODEL', 'gpt-4o'),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this document comprehensively. Include numbers, dates, and key details. Provide a structured, clear extraction."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096,
+            temperature=0.2,
+            top_p=0.1,
+            frequency_penalty=0.1,
+            presence_penalty=0.1
+        )
+        
+        page_text = response.choices[0].message.content
+        return f"Page {i+1}:\n{page_text}" if page_text else None
+    
+    except Exception as e:
+        logging.error(f"Error processing page {i}: {str(e)}")
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        return None
+
+def upsert_to_pinecone_batch(documents):
+    """Batch upsert documents to Pinecone"""
+    try:
+        pinecone_index = init_pinecone()
+        
+        # Prepare batch data
+        vectors = [(doc['id'], doc['embedding'], doc['metadata']) for doc in documents]
+        
+        # Retry mechanism with exponential backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                pinecone_index.upsert(vectors=vectors)
+                logging.info(f"Successfully upserted batch to Pinecone")
+                break
+            except Exception as retry_error:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logging.warning(f"Pinecone upsert attempt {attempt + 1} failed. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise retry_error
+    except Exception as e:
+        logging.error(f"Pinecone batch upsert error: {str(e)}")
+
+def retry_request(func, *args, max_retries=3, retry_delay=5, **kwargs):
+    """Retry a function call with exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logging.error(f"Error during attempt {attempt + 1}: {str(e)}")
+            if attempt < max_retries - 1:
+                logging.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logging.error("All retry attempts failed")
+                raise
 
 class OAuthHandler(http.server.BaseHTTPRequestHandler):
     """Handle OAuth callback"""
