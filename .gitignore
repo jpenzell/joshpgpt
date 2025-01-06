@@ -56,3 +56,11 @@ document_list_cache.json
 document_id_cache.json
 retrieval_metadata.json
 processing_checkpoint.json
+
+# JSON files
+*.json
+!package.json
+!package-lock.json
+
+# Python cache files
+*.pyc
