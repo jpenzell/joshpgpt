@@ -52,17 +52,72 @@ def retry_with_backoff(func, max_retries=3, initial_delay=1):
     return wrapper
 
 @retry_with_backoff
-def create_embedding(text):
-    """Create embedding for text using OpenAI with retry logic"""
+def create_embedding(text, max_tokens=8000):
+    """Create embedding for text, handling large texts by chunking"""
     try:
-        response = client.embeddings.create(
-            model=os.getenv('OPENAI_EMBEDDING_MODEL'),
-            input=text
-        )
-        return response.data[0].embedding
+        # Initialize OpenAI client
+        client = OpenAI()
+        
+        # Split text into chunks if needed
+        import tiktoken
+        encoding = tiktoken.get_encoding("cl100k_base")
+        tokens = encoding.encode(text)
+        
+        if len(tokens) > max_tokens:
+            # Split into chunks and get embeddings for each chunk
+            chunk_embeddings = []
+            for i in range(0, len(tokens), max_tokens):
+                chunk_tokens = tokens[i:i + max_tokens]
+                chunk_text = encoding.decode(chunk_tokens)
+                
+                # Get embedding for chunk with retries
+                for attempt in range(3):
+                    try:
+                        response = client.embeddings.create(
+                            model="text-embedding-3-small",
+                            input=chunk_text
+                        )
+                        chunk_embeddings.append(response.data[0].embedding)
+                        break
+                    except Exception as e:
+                        print(f"Error creating embedding: {str(e)}")
+                        if attempt < 2:
+                            print(f"Attempt {attempt + 1} failed: {str(e)}")
+                            print(f"Retrying in {2 ** attempt} seconds...")
+                            time.sleep(2 ** attempt)
+                        else:
+                            print(f"All {attempt + 1} attempts failed. Last error: {str(e)}")
+                            raise
+            
+            # Average the embeddings from all chunks
+            import numpy as np
+            combined_embedding = np.mean(chunk_embeddings, axis=0)
+            # Normalize the combined embedding
+            combined_embedding = combined_embedding / np.linalg.norm(combined_embedding)
+            return combined_embedding.tolist()
+        
+        else:
+            # For texts within token limit, proceed normally
+            for attempt in range(3):
+                try:
+                    response = client.embeddings.create(
+                        model="text-embedding-3-small",
+                        input=text
+                    )
+                    return response.data[0].embedding
+                except Exception as e:
+                    print(f"Error creating embedding: {str(e)}")
+                    if attempt < 2:
+                        print(f"Attempt {attempt + 1} failed: {str(e)}")
+                        print(f"Retrying in {2 ** attempt} seconds...")
+                        time.sleep(2 ** attempt)
+                    else:
+                        print(f"All {attempt + 1} attempts failed. Last error: {str(e)}")
+                        raise
+                        
     except Exception as e:
-        print(f"Error creating embedding: {str(e)}")
-        raise
+        print(f"Error in create_embedding: {str(e)}")
+        return None
 
 @retry_with_backoff
 def extract_text_with_vision(image_base64):

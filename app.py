@@ -23,6 +23,7 @@ import logging
 import boto3
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from PIL import Image
 
 # Load environment variables
 load_dotenv()
@@ -86,7 +87,8 @@ def refresh_if_needed(tokens):
                             'grant_type': 'refresh_token',
                             'refresh_token': refresh_token,
                             'client_id': os.getenv('SHOEBOXED_CLIENT_ID'),
-                            'client_secret': os.getenv('SHOEBOXED_CLIENT_SECRET')
+                            'client_secret': os.getenv('SHOEBOXED_CLIENT_SECRET'),
+                            'scope': 'all'
                         },
                         headers={
                             'Content-Type': 'application/x-www-form-urlencoded',
@@ -97,6 +99,10 @@ def refresh_if_needed(tokens):
                     
                     if response.status_code == 200:
                         new_tokens = response.json()
+                        # Preserve the refresh token if not included in response
+                        if 'refresh_token' not in new_tokens and refresh_token:
+                            new_tokens['refresh_token'] = refresh_token
+                            
                         # Update expiration with buffer
                         new_tokens['expires_at'] = (
                             datetime.now() + 
@@ -201,6 +207,42 @@ def init_pinecone():
         print(f"Error initializing Pinecone: {str(e)}")
         return None
 
+def validate_and_repair_pdf(pdf_bytes):
+    """Validate and attempt to repair PDF if needed"""
+    try:
+        import pikepdf
+        import tempfile
+        
+        # Create a temporary file for the PDF
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+            temp_pdf.write(pdf_bytes)
+            temp_pdf_path = temp_pdf.name
+        
+        try:
+            # Try to open and save the PDF (this will attempt basic repairs)
+            with pikepdf.open(temp_pdf_path, allow_overwriting_input=True) as pdf:
+                # Save to a new temporary file
+                repaired_path = temp_pdf_path + '_repaired.pdf'
+                pdf.save(repaired_path)
+                
+                # Read the repaired PDF
+                with open(repaired_path, 'rb') as f:
+                    repaired_bytes = f.read()
+                
+                # Clean up temporary files
+                os.unlink(repaired_path)
+                os.unlink(temp_pdf_path)
+                
+                return repaired_bytes
+        except Exception as e:
+            logging.error(f"PDF repair failed: {str(e)}")
+            os.unlink(temp_pdf_path)
+            return None
+            
+    except Exception as e:
+        logging.error(f"PDF validation error: {str(e)}")
+        return None
+
 def extract_text_with_gpt4o(pdf_bytes):
     """Extract text from PDF using GPT-4o Vision"""
     try:
@@ -208,26 +250,50 @@ def extract_text_with_gpt4o(pdf_bytes):
         if not isinstance(pdf_bytes, bytes):
             logging.error("Input must be bytes")
             return None
-            
+        
         # Create a BytesIO object from the bytes
         pdf_stream = BytesIO(pdf_bytes)
         
-        # Convert PDF to images
-        try:
-            images = convert_from_bytes(pdf_stream.read())
-        except Exception as e:
-            logging.error(f"Error converting PDF to images: {str(e)}")
-            logging.error(f"Traceback: {traceback.format_exc()}")
+        # Try multiple PDF to image conversion methods
+        images = None
+        conversion_methods = [
+            ('pdf2image', lambda: convert_from_bytes(pdf_stream.read())),
+            ('PyMuPDF', lambda: convert_with_pymupdf(pdf_stream)),
+            ('Poppler', lambda: convert_with_poppler(pdf_stream))
+        ]
+        
+        for method_name, converter in conversion_methods:
+            try:
+                logging.info(f"Attempting PDF conversion using {method_name}...")
+                pdf_stream.seek(0)  # Reset stream position
+                images = converter()
+                if images:
+                    logging.info(f"Successfully converted PDF using {method_name}")
+                    break
+            except Exception as e:
+                logging.error(f"{method_name} conversion failed: {str(e)}")
+                continue
+        
+        if not images:
+            logging.error("All PDF conversion methods failed")
             return None
         
-        # Process pages concurrently
+        # Process pages concurrently with improved error handling
         image_texts = []
         with ThreadPoolExecutor() as executor:
-            future_to_page = {executor.submit(process_page, i, image): i for i, image in enumerate(images)}
+            future_to_page = {
+                executor.submit(process_page_with_retry, i, image): i 
+                for i, image in enumerate(images)
+            }
+            
             for future in as_completed(future_to_page):
-                page_text = future.result()
-                if page_text:
-                    image_texts.append(page_text)
+                try:
+                    page_num = future_to_page[future]
+                    page_text = future.result()
+                    if page_text:
+                        image_texts.append(f"Page {page_num + 1}:\n{page_text}")
+                except Exception as e:
+                    logging.error(f"Error processing page: {str(e)}")
         
         # Combine texts from all pages
         return "\n\n".join(image_texts) if image_texts else None
@@ -236,6 +302,63 @@ def extract_text_with_gpt4o(pdf_bytes):
         logging.error(f"Error in GPT-4o document text extraction: {str(e)}")
         logging.error(f"Traceback: {traceback.format_exc()}")
         return None
+
+def convert_with_pymupdf(pdf_stream):
+    """Convert PDF to images using PyMuPDF"""
+    import fitz
+    doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
+    images = []
+    for page in doc:
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.tobytes())
+        images.append(img)
+    doc.close()
+    return images if images else None
+
+def convert_with_poppler(pdf_stream):
+    """Convert PDF to images using Poppler directly"""
+    import subprocess
+    import tempfile
+    
+    # Save PDF to temporary file
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+        temp_pdf.write(pdf_stream.read())
+        pdf_path = temp_pdf.name
+    
+    # Create temporary directory for output images
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Use pdftoppm (from Poppler) directly
+            subprocess.run([
+                'pdftoppm',
+                '-png',
+                pdf_path,
+                f"{temp_dir}/page"
+            ], check=True)
+            
+            # Load the generated images
+            images = []
+            for img_file in sorted(os.listdir(temp_dir)):
+                if img_file.endswith('.png'):
+                    img_path = os.path.join(temp_dir, img_file)
+                    images.append(Image.open(img_path))
+            
+            return images
+        finally:
+            os.unlink(pdf_path)
+    
+    return None
+
+def process_page_with_retry(i, image, max_retries=3):
+    """Process a single page with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return process_page(i, image)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logging.error(f"Failed to process page {i} after {max_retries} attempts: {str(e)}")
+                return None
+            time.sleep(2 ** attempt)  # Exponential backoff
 
 def process_page(i, image):
     """Process a single page image and extract text"""
@@ -695,31 +818,62 @@ def download_document(doc_details, tokens):
         logging.error(f"Traceback: {traceback.format_exc()}")
         return None
 
+def sanitize_pdf(pdf_bytes):
+    """Attempt to sanitize and repair a PDF file"""
+    try:
+        import pikepdf
+        import tempfile
+        import os
+        
+        # Create a temporary file for the PDF
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+            temp_pdf.write(pdf_bytes)
+            temp_pdf_path = temp_pdf.name
+        
+        try:
+            # Try to open and save the PDF (this will attempt repairs)
+            with pikepdf.open(temp_pdf_path, allow_overwriting_input=True) as pdf:
+                # Save to a new temporary file
+                repaired_path = temp_pdf_path + '_repaired.pdf'
+                pdf.save(repaired_path)
+                
+                # Read the repaired PDF
+                with open(repaired_path, 'rb') as f:
+                    repaired_bytes = f.read()
+                
+                # Clean up temporary files
+                os.unlink(repaired_path)
+                os.unlink(temp_pdf_path)
+                
+                return repaired_bytes
+        except Exception as e:
+            logging.error(f"PDF repair failed: {str(e)}")
+            if os.path.exists(temp_pdf_path):
+                os.unlink(temp_pdf_path)
+            return None
+            
+    except Exception as e:
+        logging.error(f"PDF sanitization error: {str(e)}")
+        return None
+
 def process_single_document(doc_details, tokens, state):
-    """
-    Process a single document regardless of its Shoeboxed processing state
-    """
+    """Process a single document regardless of its Shoeboxed processing state"""
     try:
         doc_id = doc_details.get('id')
+        retry_count = state.get_retry_count(doc_id)
+        
+        # Implement exponential backoff if this is a retry
+        if retry_count > 0:
+            backoff_time = min(300, 5 * (2 ** (retry_count - 1)))  # Max 5 minutes
+            print(f"⏳ Retry backoff: waiting {backoff_time} seconds before attempt {retry_count + 1}", flush=True)
+            time.sleep(backoff_time)
+        
         print(f"\n{'='*80}", flush=True)
         print(f"📄 Processing document {doc_id}:", flush=True)
         print(f"  Type: {doc_details.get('type')}", flush=True)
         print(f"  Vendor: {doc_details.get('vendor', 'Unknown')}", flush=True)
         print(f"  Upload Date: {doc_details.get('uploaded')}", flush=True)
         print(f"  Total Amount: ${doc_details.get('total', 'N/A')}", flush=True)
-        
-        # Fix categories handling
-        categories = doc_details.get('categories')
-        if isinstance(categories, list):
-            categories_str = ', '.join(categories) or 'None'
-        else:
-            categories_str = str(categories) if categories else 'None'
-        print(f"  Categories: {categories_str}", flush=True)
-        
-        print(f"  Processing State: {doc_details.get('processingState', 'Unknown')}", flush=True)
-        if doc_id in state.failed_docs:
-            print(f"  Previous Failure: {state.failure_reasons.get(doc_id, 'Unknown reason')}", flush=True)
-        print(f"{'='*80}", flush=True)
         
         # Skip if document is already processed in our system
         if not state.should_process_doc(doc_id):
@@ -732,9 +886,17 @@ def process_single_document(doc_details, tokens, state):
         if not document_content:
             state.mark_failed(doc_id, "Failed to download document")
             print(f"❌ Failed to download document {doc_id}", flush=True)
-            print(f"   Document details: {json.dumps(doc_details, indent=2)}", flush=True)
             return False
         print(f"✅ Downloaded document: {len(document_content):,} bytes", flush=True)
+        
+        # Try to sanitize/repair PDF if needed
+        print(f"🔧 Attempting to sanitize/repair PDF...", flush=True)
+        sanitized_content = sanitize_pdf(document_content)
+        if sanitized_content:
+            print(f"✅ Successfully sanitized PDF", flush=True)
+            document_content = sanitized_content
+        else:
+            print(f"⚠️ Could not sanitize PDF, proceeding with original", flush=True)
         
         # Save document locally
         os.makedirs('documents', exist_ok=True)
@@ -749,10 +911,12 @@ def process_single_document(doc_details, tokens, state):
         start_time = time.time()
         extracted_text = extract_text_with_gpt4o(document_content)
         extraction_time = time.time() - start_time
+        
         if not extracted_text:
             state.mark_failed(doc_id, "Failed to extract text")
             print(f"❌ Failed to extract text from document {doc_id}")
             return False
+        
         print(f"✅ Successfully extracted text:")
         print(f"   Characters: {len(extracted_text):,}")
         print(f"   Words: {len(extracted_text.split()):,}")
@@ -834,6 +998,15 @@ def process_single_document(doc_details, tokens, state):
         print(f"{'='*80}\n")
         return False
 
+def split_large_document(document_content, chunk_size=500_000):
+    """Split a large document into smaller chunks"""
+    chunks = []
+    total_size = len(document_content)
+    for i in range(0, total_size, chunk_size):
+        chunk = document_content[i:i + chunk_size]
+        chunks.append(chunk)
+    return chunks
+
 class ProcessingCheckpoint:
     def __init__(self):
         self.checkpoint_file = 'processing_checkpoint.json'
@@ -842,6 +1015,7 @@ class ProcessingCheckpoint:
         self.failed_docs = set()
         self.skipped_docs = set()
         self.failure_reasons = {}  # Track why each document failed
+        self.retry_counts = {}     # Track retry attempts per document
         self.last_processed_time = None
         self.load_checkpoint()
     
@@ -856,6 +1030,7 @@ class ProcessingCheckpoint:
                     self.failed_docs = set(data.get('failed_docs', []))
                     self.skipped_docs = set(data.get('skipped_docs', []))
                     self.failure_reasons = data.get('failure_reasons', {})
+                    self.retry_counts = data.get('retry_counts', {})
                     self.last_processed_time = data.get('last_processed_time')
                 print(f"📥 Loaded checkpoint: Batch {self.current_batch}")
                 print(f"✅ Processed: {len(self.processed_docs)} documents")
@@ -865,7 +1040,8 @@ class ProcessingCheckpoint:
                     print("\n❌ Failed Documents and Reasons:")
                     for doc_id in self.failed_docs:
                         reason = self.failure_reasons.get(doc_id, "Unknown reason")
-                        print(f"   {doc_id}: {reason}")
+                        retries = self.retry_counts.get(doc_id, 0)
+                        print(f"   {doc_id}: {reason} (Retries: {retries})")
         except Exception as e:
             print(f"⚠️ Error loading checkpoint: {str(e)}")
     
@@ -878,6 +1054,7 @@ class ProcessingCheckpoint:
                 'failed_docs': list(self.failed_docs),
                 'skipped_docs': list(self.skipped_docs),
                 'failure_reasons': self.failure_reasons,
+                'retry_counts': self.retry_counts,
                 'last_processed_time': datetime.now().isoformat()
             }
             with open(self.checkpoint_file, 'w') as f:
@@ -892,13 +1069,40 @@ class ProcessingCheckpoint:
         if doc_id in self.failed_docs:
             self.failed_docs.remove(doc_id)
             self.failure_reasons.pop(doc_id, None)
+        self.retry_counts.pop(doc_id, None)  # Clear retry count on success
         self.save_checkpoint()
     
     def mark_failed(self, doc_id, reason="Unknown error"):
         """Mark a document as failed with a reason"""
         self.failed_docs.add(doc_id)
         self.failure_reasons[doc_id] = reason
+        # Increment retry count
+        self.retry_counts[doc_id] = self.retry_counts.get(doc_id, 0) + 1
         self.save_checkpoint()
+    
+    def get_retry_count(self, doc_id):
+        """Get the number of retry attempts for a document"""
+        return self.retry_counts.get(doc_id, 0)
+    
+    def should_retry(self, doc_id, max_retries=3):
+        """Check if a document should be retried based on error category and retry count"""
+        if doc_id not in self.failed_docs:
+            return True
+            
+        error_message = self.failure_reasons.get(doc_id, "Unknown error")
+        error_category = categorize_error(error_message)
+        retry_count = self.get_retry_count(doc_id)
+        
+        # Log retry decision information
+        print(f"🔄 Retry Decision for {doc_id}:")
+        print(f"   Error Category: {error_category}")
+        print(f"   Current Retry Count: {retry_count}")
+        
+        should_retry = should_retry_error(error_category, retry_count)
+        if not should_retry:
+            print(f"❌ Maximum retries reached for {error_category} (max allowed: {max_retries})")
+        
+        return should_retry
     
     def mark_skipped(self, doc_id):
         """Mark a document as skipped"""
@@ -922,6 +1126,9 @@ class ProcessingStats:
         self.processing_times = []  # List of processing times for each document
         self.total_documents = 0
         self.processed_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
+        self.current_batch = 0
         
     def add_processing_time(self, duration):
         """Add a new processing time and update averages"""
@@ -949,9 +1156,9 @@ class ProcessingStats:
         minutes = int((total_remaining_time % 3600) // 60)
         
         if hours > 0:
-            return f"~{hours}h {minutes}m remaining"
+            return f"~{hours}h {minutes}m"
         else:
-            return f"~{minutes}m remaining"
+            return f"~{minutes}m"
     
     def get_processing_rate(self):
         """Calculate current processing rate (docs per minute)"""
@@ -961,6 +1168,19 @@ class ProcessingStats:
         if avg_time == 0:
             return 0
         return 60 / avg_time  # Convert to docs per minute
+    
+    def update_counts(self, processed=0, failed=0, skipped=0):
+        """Update document counts"""
+        self.processed_count += processed
+        self.failed_count += failed
+        self.skipped_count += skipped
+    
+    def get_progress(self):
+        """Calculate overall progress percentage"""
+        if self.total_documents == 0:
+            return 0
+        total_processed = self.processed_count + self.failed_count + self.skipped_count
+        return (total_processed / self.total_documents) * 100
 
 def process_documents():
     """Process documents from Shoeboxed in batches"""
@@ -1700,6 +1920,37 @@ def store_in_pinecone(index, doc_id, extracted_text, metadata):
     except Exception as e:
         print(f"❌ Error storing document {doc_id} in Pinecone: {str(e)}")
         return False
+
+def categorize_error(error_message):
+    """Categorize errors to help with retry strategies"""
+    error_message = error_message.lower()
+    if any(term in error_message for term in ['timeout', 'connection refused', 'connection error']):
+        return 'NETWORK_ERROR'
+    elif any(term in error_message for term in ['token', 'unauthorized', 'authentication']):
+        return 'AUTH_ERROR'
+    elif any(term in error_message for term in ['rate limit', 'too many requests']):
+        return 'RATE_LIMIT'
+    elif any(term in error_message for term in ['not found', '404']):
+        return 'NOT_FOUND'
+    elif any(term in error_message for term in ['server error', '500', '502', '503', '504']):
+        return 'SERVER_ERROR'
+    elif 'file size' in error_message or 'too large' in error_message:
+        return 'SIZE_ERROR'
+    else:
+        return 'UNKNOWN_ERROR'
+
+def should_retry_error(error_category, retry_count):
+    """Determine if an error should be retried based on its category"""
+    max_retries = {
+        'NETWORK_ERROR': 5,
+        'AUTH_ERROR': 3,
+        'RATE_LIMIT': 5,
+        'NOT_FOUND': 1,
+        'SERVER_ERROR': 4,
+        'SIZE_ERROR': 2,
+        'UNKNOWN_ERROR': 3
+    }
+    return retry_count < max_retries.get(error_category, 3)
 
 if __name__ == "__main__":
     main()
