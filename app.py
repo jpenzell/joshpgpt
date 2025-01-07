@@ -1383,10 +1383,6 @@ def process_documents():
         
         # Create metrics columns at the top
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
-        col2.metric("❌ Failed Documents", len(checkpoint.failed_docs))
-        col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_docs))
-        col4.metric("🔄 Currently Processing", 0)
         
         # Create progress bar and status
         progress_bar = st.progress(0)
@@ -1904,7 +1900,7 @@ def upsert_to_pinecone(document_id, text_embedding, metadata):
 
 def fetch_document_details(account_id, doc_id, access_token):
     """
-    Fetch detailed information for a specific document using Shoeboxed V2 API.
+    Fetch detailed information about a specific document
     
     Args:
         account_id (str): Shoeboxed account ID
@@ -1927,7 +1923,7 @@ def fetch_document_details(account_id, doc_id, access_token):
     }
     
     try:
-        # First get document details
+        # Get document details
         response = requests.get(endpoint, headers=headers, timeout=10)
         
         if response.status_code == 200:
@@ -1938,58 +1934,6 @@ def fetch_document_details(account_id, doc_id, access_token):
             print("=" * 80)
             print(json.dumps(doc_data, indent=2))
             print("=" * 80)
-            
-            # Now get the download URL based on document type
-            download_endpoint = None
-            if doc_type == 'receipt':
-                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/receipts/{doc_id}/download"
-            elif doc_type == 'business-card':
-                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/business-cards/{doc_id}/download"
-            else:
-                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}/download"
-            
-            print(f"Checking download URL: {download_endpoint}")
-            
-            # Make a HEAD request to verify the download URL
-            download_headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Accept': 'application/pdf,image/*',
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            
-            try:
-                download_response = requests.head(
-                    download_endpoint,
-                    headers=download_headers,
-                    allow_redirects=True,
-                    timeout=10
-                )
-                
-                print(f"Download response status: {download_response.status_code}")
-                print(f"Download response headers: {dict(download_response.headers)}")
-                
-                if download_response.status_code in [200, 302]:
-                    # For S3 URLs, get the Location header from the redirect
-                    if download_response.status_code == 302:
-                        actual_download_url = download_response.headers.get('Location')
-                        print(f"🔄 Redirected to: {actual_download_url}")
-                        doc_data['attachment'] = {
-                            'url': actual_download_url,
-                            'name': f"{doc_type}_{doc_id}.pdf"
-                        }
-                    else:
-                        doc_data['attachment'] = {
-                            'url': download_endpoint,
-                            'name': f"{doc_type}_{doc_id}.pdf"
-                        }
-                    print(f"✅ Successfully added download URL to document {doc_id}")
-                else:
-                    print(f"❌ Failed to verify download URL for document {doc_id}")
-                    print(f"Response status: {download_response.status_code}")
-                    print(f"Response headers: {download_response.headers}")
-            except Exception as e:
-                print(f"❌ Error checking download URL: {str(e)}")
-                print(f"Traceback: {traceback.format_exc()}")
             
             # Add account ID to document data
             doc_data['accountId'] = account_id
