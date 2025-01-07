@@ -24,6 +24,9 @@ import boto3
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
+import tempfile
+import fitz
+import gc
 
 # Load environment variables
 load_dotenv()
@@ -56,22 +59,33 @@ def load_tokens():
         return None
 
 def refresh_if_needed(tokens):
-    """Check if token needs refresh and refresh if necessary"""
+    """Enhanced token refresh with better error handling and longer buffer"""
     if not tokens:
         return None
         
     try:
-        # Add buffer time to refresh before expiration
-        REFRESH_BUFFER_MINUTES = 5
-        expires_at = datetime.fromisoformat(tokens.get('expires_at', datetime.now().isoformat()))
+        # Increase buffer time to 15 minutes for long-running tasks
+        REFRESH_BUFFER_MINUTES = 15
         
-        # Check if token will expire soon (within buffer time)
+        # Validate token data structure
+        required_fields = ['access_token', 'expires_at']
+        if not all(field in tokens for field in required_fields):
+            print("❌ Invalid token data structure")
+            return None
+            
+        try:
+            expires_at = datetime.fromisoformat(tokens.get('expires_at'))
+        except (ValueError, TypeError):
+            print("❌ Invalid expiration date format")
+            return None
+            
+        # Check if token will expire soon
         if datetime.now() + timedelta(minutes=REFRESH_BUFFER_MINUTES) >= expires_at:
             print("\n🔄 Token needs refresh...")
             
-            # Implement token refresh with retries
+            # Implement token refresh with improved retry logic
             max_retries = 3
-            retry_delay = 5  # seconds
+            base_delay = 5  # seconds
             
             for attempt in range(max_retries):
                 try:
@@ -80,7 +94,11 @@ def refresh_if_needed(tokens):
                         print("❌ No refresh token available")
                         return None
                     
-                    print(f"Refresh attempt {attempt + 1}/{max_retries}")
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    if attempt > 0:
+                        print(f"Waiting {delay} seconds before retry {attempt + 1}/{max_retries}")
+                        time.sleep(delay)
+                    
                     response = requests.post(
                         os.getenv('SHOEBOXED_TOKEN_URL'),
                         data={
@@ -94,12 +112,19 @@ def refresh_if_needed(tokens):
                             'Content-Type': 'application/x-www-form-urlencoded',
                             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             'Accept': 'application/json'
-                        }
+                        },
+                        timeout=30  # Add timeout
                     )
                     
                     if response.status_code == 200:
                         new_tokens = response.json()
-                        # Preserve the refresh token if not included in response
+                        
+                        # Validate response structure
+                        if 'access_token' not in new_tokens:
+                            print("❌ Invalid response: missing access_token")
+                            continue
+                            
+                        # Preserve the refresh token if not included
                         if 'refresh_token' not in new_tokens and refresh_token:
                             new_tokens['refresh_token'] = refresh_token
                             
@@ -109,9 +134,17 @@ def refresh_if_needed(tokens):
                             timedelta(seconds=new_tokens.get('expires_in', 3600))
                         ).isoformat()
                         
-                        # Save new tokens
-                        with open('.auth_success', 'w') as f:
-                            json.dump(new_tokens, f)
+                        # Atomic write to token file
+                        temp_file = '.auth_success.tmp'
+                        try:
+                            with open(temp_file, 'w') as f:
+                                json.dump(new_tokens, f)
+                            os.replace(temp_file, '.auth_success')
+                        except Exception as e:
+                            print(f"❌ Error saving tokens: {str(e)}")
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                            raise
                         
                         print("✅ Token refresh successful")
                         return new_tokens
@@ -119,24 +152,16 @@ def refresh_if_needed(tokens):
                         print(f"⚠️ Token refresh failed (Attempt {attempt + 1}): Status {response.status_code}")
                         print(f"Response: {response.text}")
                         
-                        if attempt < max_retries - 1:
-                            print(f"Retrying in {retry_delay} seconds...")
-                            time.sleep(retry_delay)
-                            retry_delay *= 2  # Exponential backoff
-                        else:
-                            print("❌ All refresh attempts failed")
-                            return None
-                            
+                except requests.exceptions.Timeout:
+                    print(f"⚠️ Request timeout on attempt {attempt + 1}")
+                except requests.exceptions.ConnectionError:
+                    print(f"⚠️ Connection error on attempt {attempt + 1}")
                 except Exception as e:
-                    print(f"⚠️ Error during refresh attempt {attempt + 1}: {str(e)}")
-                    if attempt < max_retries - 1:
-                        print(f"Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2
-                    else:
-                        print("❌ All refresh attempts failed")
-                        return None
-                        
+                    print(f"⚠️ Unexpected error on attempt {attempt + 1}: {str(e)}")
+                
+            print("❌ All refresh attempts failed")
+            return None
+            
         return tokens
         
     except Exception as e:
@@ -1951,6 +1976,91 @@ def should_retry_error(error_category, retry_count):
         'UNKNOWN_ERROR': 3
     }
     return retry_count < max_retries.get(error_category, 3)
+
+class ResourceManager:
+    """Context manager for handling temporary resources"""
+    def __init__(self):
+        self.temp_files = []
+        self.temp_dirs = []
+    
+    def add_temp_file(self, filepath):
+        self.temp_files.append(filepath)
+        return filepath
+    
+    def add_temp_dir(self, dirpath):
+        self.temp_dirs.append(dirpath)
+        return dirpath
+    
+    def cleanup(self):
+        """Clean up all temporary resources"""
+        for filepath in self.temp_files:
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception as e:
+                print(f"⚠️ Error removing temporary file {filepath}: {str(e)}")
+        
+        for dirpath in self.temp_dirs:
+            try:
+                if os.path.exists(dirpath):
+                    shutil.rmtree(dirpath)
+            except Exception as e:
+                print(f"⚠️ Error removing temporary directory {dirpath}: {str(e)}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+
+def process_large_pdf(pdf_bytes, chunk_size=10):
+    """Process large PDFs in chunks to manage memory"""
+    try:
+        # Convert PDF to images
+        with ResourceManager() as rm:
+            # Create temporary directory for image chunks
+            temp_dir = rm.add_temp_dir(tempfile.mkdtemp())
+            
+            # Convert PDF to images in chunks
+            images = []
+            pdf_stream = BytesIO(pdf_bytes)
+            
+            # Get total number of pages
+            pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+            total_pages = pdf.page_count
+            pdf.close()
+            
+            # Process in chunks
+            extracted_texts = []
+            for start_page in range(0, total_pages, chunk_size):
+                end_page = min(start_page + chunk_size, total_pages)
+                
+                # Convert chunk to images
+                chunk_images = convert_from_bytes(
+                    pdf_bytes,
+                    first_page=start_page + 1,
+                    last_page=end_page
+                )
+                
+                # Process each image in the chunk
+                chunk_texts = []
+                for i, image in enumerate(chunk_images):
+                    page_num = start_page + i + 1
+                    text = process_page_with_retry(page_num, image)
+                    if text:
+                        chunk_texts.append(text)
+                
+                # Clear chunk images from memory
+                del chunk_images
+                gc.collect()
+                
+                extracted_texts.extend(chunk_texts)
+            
+            return "\n\n".join(extracted_texts)
+    
+    except Exception as e:
+        print(f"❌ Error processing large PDF: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     main()
