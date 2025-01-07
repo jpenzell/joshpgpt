@@ -17,8 +17,8 @@ from pinecone import Pinecone
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import requests
-from fetch_documents import fetch_documents
-from process_for_pinecone import extract_text_from_pdf, create_embedding, ProcessingState
+from fetch_documents import fetch_all_documents  # Updated import
+from process_for_pinecone import create_embedding  # Added import for create_embedding
 import logging
 import boto3
 import shutil

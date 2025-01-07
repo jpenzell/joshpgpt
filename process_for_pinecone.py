@@ -22,12 +22,232 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+import concurrent.futures
+from typing import List, Dict
+import numpy as np
+import multiprocessing
+import psutil
 
 # Load environment variables
 load_dotenv()
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+# Dynamic resource allocation
+CPU_COUNT = multiprocessing.cpu_count()
+MEMORY_GB = psutil.virtual_memory().total / (1024 ** 3)  # Memory in GB
+
+# Optimized constants
+MAX_WORKERS = max(4, min(CPU_COUNT - 1, 8))  # Leave one core free, max 8 workers
+BATCH_SIZE = 20  # Increased from 10
+EMBEDDING_BATCH_SIZE = 50  # Increased from 20
+EMBEDDING_DIMENSIONS = 384  # Reduced from 1536 for better performance
+MAX_MEMORY_PERCENT = 75  # Maximum memory usage percentage
+
+# Cache configuration
+CACHE_DIR = os.path.join(os.path.dirname(__file__), 'cache')
+EMBEDDING_CACHE_FILE = os.path.join(CACHE_DIR, 'embedding_cache.json')
+
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Initialize embedding cache
+embedding_cache = {}
+if os.path.exists(EMBEDDING_CACHE_FILE):
+    try:
+        with open(EMBEDDING_CACHE_FILE, 'r') as f:
+            embedding_cache = json.load(f)
+    except Exception as e:
+        print(f"Error loading embedding cache: {str(e)}")
+
+def save_embedding_cache():
+    """Save embedding cache to disk"""
+    try:
+        with open(EMBEDDING_CACHE_FILE, 'w') as f:
+            json.dump(embedding_cache, f)
+    except Exception as e:
+        print(f"Error saving embedding cache: {str(e)}")
+
+def check_memory_usage():
+    """Check if memory usage is within limits"""
+    memory_percent = psutil.virtual_memory().percent
+    return memory_percent < MAX_MEMORY_PERCENT
+
+def cleanup_temp_files():
+    """Clean up temporary files"""
+    temp_dir = os.path.join(os.path.dirname(__file__), 'documents')
+    if os.path.exists(temp_dir):
+        for file in os.listdir(temp_dir):
+            try:
+                file_path = os.path.join(temp_dir, file)
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception as e:
+                print(f"Error deleting {file}: {str(e)}")
+
+def process_document_batch(documents: List[Dict]) -> List[Dict]:
+    """Process a batch of documents in parallel"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = list(executor.map(process_single_document, documents))
+    return [r for r in results if r is not None]
+
+def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Create embeddings for a batch of texts using the OpenAI API with caching"""
+    try:
+        # Check memory usage before processing
+        if not check_memory_usage():
+            print("⚠️ High memory usage detected, waiting for cleanup...")
+            cleanup_temp_files()
+            time.sleep(5)  # Wait for memory to be freed
+        
+        # Initialize results list
+        results = []
+        uncached_texts = []
+        uncached_indices = []
+        
+        # Check cache for existing embeddings
+        for i, text in enumerate(texts):
+            text_hash = hash(text)
+            if text_hash in embedding_cache:
+                results.append(embedding_cache[text_hash])
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+        
+        # If there are uncached texts, get their embeddings
+        if uncached_texts:
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=uncached_texts,
+                dimensions=EMBEDDING_DIMENSIONS  # Use optimized dimensions
+            )
+            
+            # Process new embeddings
+            new_embeddings = [embedding.embedding for embedding in response.data]
+            
+            # Update cache and results
+            for i, embedding in zip(uncached_indices, new_embeddings):
+                text_hash = hash(texts[i])
+                embedding_cache[text_hash] = embedding
+                results.insert(i, embedding)
+            
+            # Save updated cache
+            save_embedding_cache()
+        
+        return results
+    except Exception as e:
+        print(f"Error creating embeddings batch: {str(e)}")
+        return []
+
+def process_documents_with_batching(documents: List[Dict]) -> None:
+    """Process documents in batches with parallel processing and batch embeddings"""
+    total_docs = len(documents)
+    successful_docs = 0
+    failed_docs = 0
+    skipped_docs = 0
+    
+    try:
+        for i in tqdm(range(0, total_docs, BATCH_SIZE), desc="Processing document batches"):
+            # Check memory usage before each batch
+            if not check_memory_usage():
+                print("\n⚠️ High memory usage detected, cleaning up...")
+                cleanup_temp_files()
+                time.sleep(5)
+            
+            batch = documents[i:i + BATCH_SIZE]
+            batch_size = len(batch)
+            
+            print(f"\n📦 Processing batch {i//BATCH_SIZE + 1} of {(total_docs + BATCH_SIZE - 1)//BATCH_SIZE}")
+            print(f"   Documents {i+1} to {min(i+batch_size, total_docs)} of {total_docs}")
+            
+            try:
+                # Process documents in parallel
+                processed_docs = process_document_batch(batch)
+                
+                # Collect texts for batch embedding
+                texts_to_embed = []
+                doc_metadata = []
+                
+                for doc in processed_docs:
+                    if doc and 'text' in doc:
+                        texts_to_embed.append(doc['text'])
+                        doc_metadata.append({
+                            'id': doc['id'],
+                            'metadata': {
+                                'title': doc.get('title', ''),
+                                'date': doc.get('date', ''),
+                                'category': doc.get('category', ''),
+                                'source': doc.get('source', ''),
+                                'processed_date': datetime.now().isoformat()
+                            }
+                        })
+                
+                # Create embeddings in optimized batches
+                for j in range(0, len(texts_to_embed), EMBEDDING_BATCH_SIZE):
+                    batch_texts = texts_to_embed[j:j + EMBEDDING_BATCH_SIZE]
+                    batch_metadata = doc_metadata[j:j + EMBEDDING_BATCH_SIZE]
+                    
+                    embeddings = create_embeddings_batch(batch_texts)
+                    
+                    # Prepare vectors for Pinecone
+                    vectors = []
+                    for embedding, meta in zip(embeddings, batch_metadata):
+                        vectors.append({
+                            'id': meta['id'],
+                            'values': embedding,
+                            'metadata': meta['metadata']
+                        })
+                    
+                    # Upsert to Pinecone with retry
+                    if vectors:
+                        success = False
+                        for attempt in range(3):
+                            try:
+                                index = Pinecone(api_key=os.getenv('PINECONE_API_KEY')).Index(os.getenv('PINECONE_INDEX_NAME'))
+                                index.upsert(vectors=vectors)
+                                success = True
+                                break
+                            except Exception as e:
+                                print(f"Error upserting to Pinecone (Attempt {attempt + 1}): {str(e)}")
+                                if attempt < 2:
+                                    time.sleep(2 ** attempt)
+                        
+                        if success:
+                            successful_docs += len(vectors)
+                        else:
+                            failed_docs += len(vectors)
+                
+                # Cleanup after each batch
+                cleanup_temp_files()
+                
+            except Exception as batch_error:
+                print(f"\n❌ Error processing batch: {str(batch_error)}")
+                failed_docs += batch_size
+                continue
+            
+            # Print progress statistics
+            print(f"\n📊 Progress Statistics:")
+            print(f"   Successful: {successful_docs}")
+            print(f"   Failed: {failed_docs}")
+            print(f"   Skipped: {skipped_docs}")
+            print(f"   Remaining: {total_docs - (successful_docs + failed_docs + skipped_docs)}")
+            
+    except Exception as e:
+        print(f"\n❌ Fatal error in batch processing: {str(e)}")
+        print(traceback.format_exc())
+    
+    finally:
+        # Final cleanup
+        cleanup_temp_files()
+        
+        # Print final statistics
+        print(f"\n🏁 Processing Complete!")
+        print(f"   Total Documents: {total_docs}")
+        print(f"   Successfully Processed: {successful_docs}")
+        print(f"   Failed: {failed_docs}")
+        print(f"   Skipped: {skipped_docs}")
+        print(f"   Success Rate: {(successful_docs/total_docs)*100:.2f}%")
 
 def retry_with_backoff(func, max_retries=3, initial_delay=1):
     """Retry a function with exponential backoff"""
