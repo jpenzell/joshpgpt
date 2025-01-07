@@ -27,6 +27,11 @@ from PIL import Image
 import tempfile
 import fitz
 import gc
+import concurrent.futures
+import queue
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -45,6 +50,12 @@ PINECONE_INDEX_HOST = os.getenv('PINECONE_INDEX_HOST')
 
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Constants for batch processing
+MAX_WORKERS = 4
+BATCH_SIZE = 10
+MAX_RETRIES = 3
+RATE_LIMIT_DELAY = 1.0
 
 def load_tokens():
     """Load tokens from file"""
@@ -1207,15 +1218,141 @@ class ProcessingStats:
         total_processed = self.processed_count + self.failed_count + self.skipped_count
         return (total_processed / self.total_documents) * 100
 
+@dataclass
+class ProcessingResult:
+    doc_id: str
+    success: bool
+    error: Optional[str] = None
+    processing_time: float = 0.0
+
+class DocumentProcessor:
+    def __init__(self, tokens, checkpoint):
+        self.tokens = tokens
+        self.checkpoint = checkpoint
+        self.processing_queue = queue.Queue()
+        self.results_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.metrics = {
+            'processed': 0,
+            'failed': 0,
+            'skipped': 0,
+            'total_time': 0.0
+        }
+        self.lock = threading.Lock()
+
+    def process_document_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                doc = self.processing_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            start_time = time.time()
+            try:
+                success = process_single_document(doc, self.tokens, self.checkpoint)
+                processing_time = time.time() - start_time
+                
+                result = ProcessingResult(
+                    doc_id=doc['id'],
+                    success=success,
+                    processing_time=processing_time
+                )
+                
+                with self.lock:
+                    if success:
+                        self.metrics['processed'] += 1
+                    else:
+                        self.metrics['failed'] += 1
+                    self.metrics['total_time'] += processing_time
+                
+            except Exception as e:
+                result = ProcessingResult(
+                    doc_id=doc['id'],
+                    success=False,
+                    error=str(e),
+                    processing_time=time.time() - start_time
+                )
+                
+                with self.lock:
+                    self.metrics['failed'] += 1
+                    self.metrics['total_time'] += time.time() - start_time
+
+            self.results_queue.put(result)
+            time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
+
+    def process_batch(self, documents: List[Dict], progress_bar, status_text, metrics_cols):
+        # Initialize queues
+        for doc in documents:
+            if not self.checkpoint.should_process_doc(doc['id']):
+                with self.lock:
+                    self.metrics['skipped'] += 1
+                continue
+            self.processing_queue.put(doc)
+
+        # Start worker threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            workers = [
+                executor.submit(self.process_document_worker)
+                for _ in range(min(MAX_WORKERS, len(documents)))
+            ]
+
+            # Monitor progress
+            completed = 0
+            total = len(documents) - self.metrics['skipped']
+            
+            while completed < total:
+                try:
+                    result = self.results_queue.get(timeout=1.0)
+                    completed += 1
+                    
+                    # Update progress
+                    progress = completed / total
+                    progress_bar.progress(progress)
+                    
+                    # Update metrics
+                    metrics_cols[0].metric("Processed", self.metrics['processed'])
+                    metrics_cols[1].metric("Failed", self.metrics['failed'])
+                    metrics_cols[2].metric("Skipped", self.metrics['skipped'])
+                    
+                    # Estimate remaining time
+                    if self.metrics['processed'] > 0:
+                        avg_time = self.metrics['total_time'] / completed
+                        remaining = total - completed
+                        est_time = avg_time * remaining
+                        time_str = f"{est_time/60:.1f}m remaining"
+                        metrics_cols[3].metric("Est. Time", time_str)
+                    
+                    # Update status
+                    if result.success:
+                        status = f"✅ Processed {result.doc_id}"
+                    else:
+                        status = f"❌ Failed {result.doc_id}: {result.error if result.error else 'Unknown error'}"
+                    status_text.text(f"Progress: {completed}/{total} - {status}")
+                    
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Error monitoring progress: {str(e)}")
+
+            # Wait for all workers to complete
+            concurrent.futures.wait(workers)
+
 def process_documents():
-    """Process documents from Shoeboxed in batches"""
+    """Process documents from Shoeboxed using parallel processing"""
     try:
-        print("\n🔍 DEBUG: Starting document processing...", flush=True)
+        # Create main progress display containers
+        main_progress = st.empty()
+        progress_bar = st.progress(0)
+        eta_col1, eta_col2, eta_col3 = st.columns(3)
         
-        # Initialize stats tracking
-        stats = ProcessingStats()
+        # Create expandable section for detailed logs
+        with st.expander("View Processing Details", expanded=False):
+            detailed_log = st.empty()
+            recent_files = []  # Keep track of 5 most recent files
         
-        # Initialize checkpoint system first
+        print("\n🔍 Starting document processing with parallel execution...", flush=True)
+        
+        # Initialize checkpoint system
         checkpoint = ProcessingCheckpoint()
         print("\n📋 Loading checkpoint...", flush=True)
         
@@ -1223,200 +1360,162 @@ def process_documents():
         start_time = time.time()
         
         # Load tokens and ensure we have access token
-        print("\n🔑 DEBUG: Loading tokens...", flush=True)
+        print("\n🔑 Loading tokens...", flush=True)
         tokens = load_tokens()
         if not tokens or 'access_token' not in tokens:
             st.error("No valid Shoeboxed access token found. Please authenticate first.")
             return
             
-        # Store access token in environment for other functions to use
+        # Store access token in environment
         os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
-        # Add token refresh before starting main processing
+        # Refresh token if needed
         tokens = refresh_if_needed(tokens)
         if not tokens:
             st.error("Failed to refresh token. Please authenticate again.")
             return
             
-        # Update access token in environment after refresh
+        # Update access token in environment
         os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
         # Get organization ID
-        print("\n🏢 DEBUG: Getting organization ID...", flush=True)
+        print("\n🏢 Getting organization ID...", flush=True)
         account_id = get_organization_id(tokens['access_token'])
         print(f"   Organization ID: {account_id}", flush=True)
         
-        # Create progress indicators
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        metrics_cols = st.columns(5)  # Added one more column for time estimate
-        total_metric = metrics_cols[0].empty()
-        processed_metric = metrics_cols[1].empty()
-        failed_metric = metrics_cols[2].empty()
-        skipped_metric = metrics_cols[3].empty()
-        time_metric = metrics_cols[4].empty()  # New metric for time estimate
-        
-        # Initialize counters
-        processed_count = len(checkpoint.processed_docs)
-        failed_count = len(checkpoint.failed_docs)
-        skipped_count = len(checkpoint.skipped_docs)
-        
-        # Update initial metrics
-        total_metric.metric("Total Documents", "Loading...")
-        processed_metric.metric("Processed", processed_count)
-        failed_metric.metric("Failed", failed_count)
-        skipped_metric.metric("Skipped", skipped_count)
-        time_metric.metric("Est. Time", "Calculating...")
+        # Initialize processor
+        processor = DocumentProcessor(tokens, checkpoint)
         
         # Retrieve document IDs
-        print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
+        print("\n🔍 Retrieving document IDs...", flush=True)
         all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
-        stats.total_documents = total_documents
-        
-        # Update total metric now that we have the count
-        total_metric.metric("Total Documents", total_documents)
         
         if total_documents == 0:
             print("✅ No new documents to process!")
             st.success("All documents have been processed!")
             return
-        
-        print(f"\n📊 Processing Summary:")
-        print(f"{'='*80}")
-        print(f"Total Documents to Process: {total_documents:,}")
-        print(f"Already Processed: {processed_count:,}")
-        print(f"Previously Failed: {failed_count:,}")
-        print(f"Previously Skipped: {skipped_count:,}")
-        print(f"{'='*80}\n")
+            
+        # Initialize processing stats
+        stats = ProcessingStats()
+        stats.total_documents = total_documents
         
         # Process documents in batches
-        batch_size = 10
-        total_batches = (total_documents + batch_size - 1) // batch_size
-        
-        for batch_index in range(total_batches):
-            # Refresh token at the start of each batch
-            tokens = refresh_if_needed(tokens)
-            if not tokens:
-                st.error("Failed to refresh token. Please authenticate again.")
-                return
+        for batch_start in range(0, total_documents, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_documents)
+            current_batch_ids = all_document_ids[batch_start:batch_end]
             
-            # Update access token in environment
-            os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
-            
-            start_idx = batch_index * batch_size
-            end_idx = min(start_idx + batch_size, total_documents)
-            current_batch = all_document_ids[start_idx:end_idx]
-            
-            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
-            print(f"   Documents {start_idx + 1} to {end_idx} of {total_documents}")
-            
-            # Update progress
-            progress = (batch_index + 1) / total_batches
-            progress_bar.progress(progress)
-            
-            # Process each document in the batch
-            for doc_id in current_batch:
-                try:
-                    print(f"\n📄 Processing document {doc_id}")
-                    doc_start_time = time.time()
-                    
-                    # Skip if already processed
-                    if not checkpoint.should_process_doc(doc_id):
-                        print(f"⏭️ Skipping already processed document {doc_id}")
-                        skipped_count += 1
-                        skipped_metric.metric("Skipped", skipped_count)
-                        continue
-                    
-                    # Check token before each document
-                    tokens = refresh_if_needed(tokens)
-                    if not tokens:
-                        st.error("Failed to refresh token. Please authenticate again.")
-                        return
-                    
-                    # Update access token in environment
-                    os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
-                    
-                    # Get document details
+            # Refresh token before each batch
+            try:
+                tokens = refresh_if_needed(tokens)
+                if not tokens:
+                    st.error("Failed to refresh token. Please authenticate again.")
+                    return
+                
+                # Get document details for the batch
+                batch_documents = []
+                for doc_id in current_batch_ids:
                     doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
-                    response = requests.get(doc_url, headers=get_shoeboxed_headers(tokens['access_token']))
-                    
-                    if response.status_code != 200:
-                        print(f"❌ Failed to get document details. Status: {response.status_code}")
-                        checkpoint.mark_failed(doc_id, f"HTTP {response.status_code}")
-                        failed_count += 1
-                        failed_metric.metric("Failed", failed_count)
-                        continue
-                    
-                    doc_data = response.json()
-                    
-                    # Process the document
-                    if process_single_document(doc_data, tokens['access_token'], checkpoint):
-                        processed_count += 1
-                        processed_metric.metric("Processed", processed_count)
-                        print(f"✅ Successfully processed document {doc_id}")
-                        
-                        # Update processing stats
-                        doc_processing_time = time.time() - doc_start_time
-                        stats.add_processing_time(doc_processing_time)
-                        
-                        # Update time estimate
-                        remaining_docs = total_documents - processed_count - skipped_count
-                        time_estimate = stats.get_estimated_completion_time(remaining_docs)
-                        processing_rate = stats.get_processing_rate()
-                        time_metric.metric(
-                            "Est. Time",
-                            time_estimate,
-                            delta=f"{processing_rate:.1f} docs/min"
-                        )
-                    else:
-                        failed_count += 1
-                        failed_metric.metric("Failed", failed_count)
-                        print(f"❌ Failed to process document {doc_id}")
-                    
-                    # Update all metrics
-                    total_metric.metric("Total Documents", total_documents)
-                    processed_metric.metric("Processed", processed_count)
-                    failed_metric.metric("Failed", failed_count)
-                    skipped_metric.metric("Skipped", skipped_count)
-                    
-                    # Update status text with current document and time estimate
-                    remaining_docs = total_documents - processed_count - skipped_count
-                    time_estimate = stats.get_estimated_completion_time(remaining_docs)
-                    status_text.text(
-                        f"Processing batch {batch_index + 1} of {total_batches} "
-                        f"({time_estimate})"
+                    response = requests.get(
+                        doc_url,
+                        headers=get_shoeboxed_headers(tokens['access_token'])
                     )
                     
-                except Exception as e:
-                    print(f"❌ Error processing document {doc_id}: {str(e)}")
-                    checkpoint.mark_failed(doc_id, str(e))
-                    failed_count += 1
-                    failed_metric.metric("Failed", failed_count)
-                    continue
-            
-            # Save checkpoint after each batch
-            checkpoint.update_batch(batch_index)
-            checkpoint.save_checkpoint()
+                    if response.status_code == 200:
+                        batch_documents.append(response.json())
+                    else:
+                        print(f"❌ Failed to get details for document {doc_id}")
+                        continue
+                
+                # Update main progress display
+                elapsed_time = time.time() - start_time
+                docs_per_minute = (stats.processed_count / elapsed_time) * 60 if elapsed_time > 0 else 0
+                remaining_docs = total_documents - stats.processed_count
+                eta_minutes = (remaining_docs / docs_per_minute) if docs_per_minute > 0 else 0
+                
+                # Include previously processed documents from checkpoint
+                total_processed = stats.processed_count + len(checkpoint.processed_docs)
+                grand_total = total_documents + len(checkpoint.processed_docs)
+                remaining_total = grand_total - total_processed
+                
+                # Update the main progress text
+                progress_text = f"""
+                ### Processing Progress
+                Documents Remaining: {remaining_total:,} of {grand_total:,}
+                Total Processed: {total_processed:,} ({(total_processed/grand_total)*100:.1f}%)
+                Rate: {docs_per_minute:.1f}/min • ETA: {eta_minutes:.1f}m
+                """
+                main_progress.markdown(progress_text)
+                
+                # Update metrics with delta values to show changes
+                eta_col1.metric(
+                    "Processed",
+                    f"{total_processed:,}/{grand_total:,}",
+                    delta=f"+{stats.processed_count}" if stats.processed_count > 0 else None
+                )
+                eta_col2.metric(
+                    "Failed",
+                    len(checkpoint.failed_docs),
+                    delta=f"+{stats.failed_count}" if stats.failed_count > 0 else None
+                )
+                eta_col3.metric(
+                    "Remaining",
+                    remaining_total,
+                    delta=f"-{stats.processed_count}" if stats.processed_count > 0 else None
+                )
+                
+                # Process the batch
+                for doc in batch_documents:
+                    # Update recent files list
+                    if len(recent_files) >= 5:
+                        recent_files.pop(0)
+                    recent_files.append({
+                        'id': doc['id'],
+                        'type': doc.get('type', 'unknown'),
+                        'status': 'Processing...'
+                    })
+                    
+                    # Update detailed log
+                    detailed_log.markdown("\n".join([
+                        f"**{f['id']}** ({f['type']}) - {f['status']}"
+                        for f in recent_files[::-1]  # Show most recent first
+                    ]))
+                    
+                    # Process document
+                    start_doc_time = time.time()
+                    success = process_single_document(doc, tokens, checkpoint)
+                    processing_time = time.time() - start_doc_time
+                    
+                    # Update stats
+                    if success:
+                        stats.processed_count += 1
+                        recent_files[-1]['status'] = f"✅ {processing_time:.1f}s"
+                    else:
+                        stats.failed_count += 1
+                        recent_files[-1]['status'] = "❌ Failed"
+                    
+                    # Update progress bar
+                    progress = (stats.processed_count + stats.failed_count) / total_documents
+                    progress_bar.progress(progress)
+                
+                # Save checkpoint after each batch
+                checkpoint.save_checkpoint()
+                
+            except Exception as e:
+                print(f"Error processing batch: {str(e)}")
+                continue
         
         # Final progress update
         progress_bar.progress(1.0)
-        status_text.text("Processing complete!")
-        
-        # Display final metrics
-        total_metric.metric("Total Documents", total_documents)
-        processed_metric.metric("Processed", processed_count)
-        failed_metric.metric("Failed", failed_count)
-        skipped_metric.metric("Skipped", skipped_count)
-        time_metric.metric("Total Time", f"{(time.time() - start_time) / 60:.1f}m")
+        main_progress.markdown(f"""
+        ### Processing Complete
+        Total Documents: {total_documents}
+        Successfully Processed: {stats.processed_count}
+        Failed: {stats.failed_count}
+        Total Time: {(time.time() - start_time) / 60:.1f} minutes
+        """)
         
         print("\n✅ Document processing complete!")
-        print(f"📊 Final Statistics:")
-        print(f"   Total Documents: {total_documents}")
-        print(f"   Processed: {processed_count}")
-        print(f"   Failed: {failed_count}")
-        print(f"   Skipped: {skipped_count}")
-        print(f"   Time taken: {time.time() - start_time:.2f} seconds")
         
     except Exception as e:
         print(f"❌ Error in document processing: {str(e)}")
@@ -1653,10 +1752,6 @@ def main():
     # Initialize session state
     init_session_state()
     
-    # Debug information
-    st.sidebar.write("Debug Info:")
-    st.sidebar.write(f"Authentication Status: {st.session_state.authenticated}")
-    
     # Sidebar
     st.sidebar.title("Controls")
     
@@ -1668,7 +1763,26 @@ def main():
     else:
         st.sidebar.success("Authenticated")
         
-        # Add reset control at the top
+        # Load checkpoint data immediately after login
+        checkpoint = ProcessingCheckpoint()
+        
+        # Display processing statistics in the main area
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
+        col2.metric("❌ Failed Documents", len(checkpoint.failed_docs))
+        col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_docs))
+        
+        # Show failed document details in an expander if there are any
+        if checkpoint.failed_docs:
+            with st.expander("Failed Documents Details"):
+                for doc_id in checkpoint.failed_docs:
+                    reason = checkpoint.failure_reasons.get(doc_id, "Unknown reason")
+                    retries = checkpoint.retry_counts.get(doc_id, 0)
+                    st.text(f"Document {doc_id}:")
+                    st.text(f"  Reason: {reason}")
+                    st.text(f"  Retry attempts: {retries}")
+        
+        # Add reset control
         if st.sidebar.button("🔄 Reset Processing"):
             with st.spinner("Resetting all processing state..."):
                 if reset_processing_state():
@@ -1690,12 +1804,9 @@ def main():
             if os.path.exists('.auth_success'):
                 os.remove('.auth_success')
             st.session_state.authenticated = False
-            st.session_state.chat_messages = []  # Clear chat history
-            st.session_state.processing_complete = False  # Reset processing state
+            st.session_state.chat_messages = []
+            st.session_state.processing_complete = False
             st.rerun()
-        
-        # Main content area
-        st.write("Ready to process documents or chat!")
         
         # Show processing status if available
         if hasattr(st.session_state, 'processing_status'):
