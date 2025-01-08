@@ -24,14 +24,8 @@ import boto3
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
-import tempfile
-import fitz
-import gc
-import concurrent.futures
 import queue
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-import threading
+import concurrent.futures
 
 # Load environment variables
 load_dotenv()
@@ -48,14 +42,12 @@ PINECONE_ENVIRONMENT = os.getenv('PINECONE_ENVIRONMENT')
 PINECONE_INDEX_NAME = os.getenv('PINECONE_INDEX_NAME')
 PINECONE_INDEX_HOST = os.getenv('PINECONE_INDEX_HOST')
 
+# Processing constants
+MAX_THREADS = 4  # Maximum number of concurrent document processing threads
+RATE_LIMIT_DELAY = 1  # Delay between documents in seconds to respect rate limits
+
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Constants for batch processing
-MAX_WORKERS = 4
-BATCH_SIZE = 10
-MAX_RETRIES = 3
-RATE_LIMIT_DELAY = 1.0
 
 def load_tokens():
     """Load tokens from file"""
@@ -70,33 +62,22 @@ def load_tokens():
         return None
 
 def refresh_if_needed(tokens):
-    """Enhanced token refresh with better error handling and longer buffer"""
+    """Check if token needs refresh and refresh if necessary"""
     if not tokens:
         return None
         
     try:
-        # Increase buffer time to 15 minutes for long-running tasks
-        REFRESH_BUFFER_MINUTES = 15
+        # Add buffer time to refresh before expiration
+        REFRESH_BUFFER_MINUTES = 5
+        expires_at = datetime.fromisoformat(tokens.get('expires_at', datetime.now().isoformat()))
         
-        # Validate token data structure
-        required_fields = ['access_token', 'expires_at']
-        if not all(field in tokens for field in required_fields):
-            print("❌ Invalid token data structure")
-            return None
-            
-        try:
-            expires_at = datetime.fromisoformat(tokens.get('expires_at'))
-        except (ValueError, TypeError):
-            print("❌ Invalid expiration date format")
-            return None
-            
-        # Check if token will expire soon
+        # Check if token will expire soon (within buffer time)
         if datetime.now() + timedelta(minutes=REFRESH_BUFFER_MINUTES) >= expires_at:
             print("\n🔄 Token needs refresh...")
             
-            # Implement token refresh with improved retry logic
+            # Implement token refresh with retries
             max_retries = 3
-            base_delay = 5  # seconds
+            retry_delay = 5  # seconds
             
             for attempt in range(max_retries):
                 try:
@@ -105,11 +86,7 @@ def refresh_if_needed(tokens):
                         print("❌ No refresh token available")
                         return None
                     
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
-                    if attempt > 0:
-                        print(f"Waiting {delay} seconds before retry {attempt + 1}/{max_retries}")
-                        time.sleep(delay)
-                    
+                    print(f"Refresh attempt {attempt + 1}/{max_retries}")
                     response = requests.post(
                         os.getenv('SHOEBOXED_TOKEN_URL'),
                         data={
@@ -123,19 +100,12 @@ def refresh_if_needed(tokens):
                             'Content-Type': 'application/x-www-form-urlencoded',
                             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             'Accept': 'application/json'
-                        },
-                        timeout=30  # Add timeout
+                        }
                     )
                     
                     if response.status_code == 200:
                         new_tokens = response.json()
-                        
-                        # Validate response structure
-                        if 'access_token' not in new_tokens:
-                            print("❌ Invalid response: missing access_token")
-                            continue
-                            
-                        # Preserve the refresh token if not included
+                        # Preserve the refresh token if not included in response
                         if 'refresh_token' not in new_tokens and refresh_token:
                             new_tokens['refresh_token'] = refresh_token
                             
@@ -145,17 +115,9 @@ def refresh_if_needed(tokens):
                             timedelta(seconds=new_tokens.get('expires_in', 3600))
                         ).isoformat()
                         
-                        # Atomic write to token file
-                        temp_file = '.auth_success.tmp'
-                        try:
-                            with open(temp_file, 'w') as f:
-                                json.dump(new_tokens, f)
-                            os.replace(temp_file, '.auth_success')
-                        except Exception as e:
-                            print(f"❌ Error saving tokens: {str(e)}")
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                            raise
+                        # Save new tokens
+                        with open('.auth_success', 'w') as f:
+                            json.dump(new_tokens, f)
                         
                         print("✅ Token refresh successful")
                         return new_tokens
@@ -163,16 +125,24 @@ def refresh_if_needed(tokens):
                         print(f"⚠️ Token refresh failed (Attempt {attempt + 1}): Status {response.status_code}")
                         print(f"Response: {response.text}")
                         
-                except requests.exceptions.Timeout:
-                    print(f"⚠️ Request timeout on attempt {attempt + 1}")
-                except requests.exceptions.ConnectionError:
-                    print(f"⚠️ Connection error on attempt {attempt + 1}")
+                        if attempt < max_retries - 1:
+                            print(f"Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            print("❌ All refresh attempts failed")
+                            return None
+                            
                 except Exception as e:
-                    print(f"⚠️ Unexpected error on attempt {attempt + 1}: {str(e)}")
-                
-            print("❌ All refresh attempts failed")
-            return None
-            
+                    print(f"⚠️ Error during refresh attempt {attempt + 1}: {str(e)}")
+                    if attempt < max_retries - 1:
+                        print(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print("❌ All refresh attempts failed")
+                        return None
+                        
         return tokens
         
     except Exception as e:
@@ -181,54 +151,53 @@ def refresh_if_needed(tokens):
 
 def init_session_state():
     """Initialize session state variables"""
-    # Initialize authentication state if not present
+    # Initialize all session state variables first
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
-    
-    # Check for existing auth token
-    if os.path.exists('.auth_success'):
-        try:
-            with open('.auth_success', 'r') as f:
-                auth_data = json.load(f)
-                # Check if token exists and is not expired
-                if auth_data.get('access_token'):
-                    # Verify token with Shoeboxed
-                    headers = {
-                        'Authorization': f'Bearer {auth_data["access_token"]}',
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Origin': 'https://api.shoeboxed.com',
-                        'Referer': 'https://api.shoeboxed.com/',
-                        'Accept-Language': 'en-US,en;q=0.9'
-                    }
-                    response = requests.get('https://api.shoeboxed.com/v2/user', headers=headers)
-                    print(f"Verification response: {response.status_code}")
-                    print(f"Response headers: {dict(response.headers)}")
-                    print(f"Response body: {response.text}")
-                    
-                    if response.status_code == 200:
-                        st.session_state.authenticated = True
-                        print("Successfully verified existing auth token")
-                    else:
-                        print(f"Token verification failed: {response.status_code}")
-                        print(f"Response: {response.text}")
-                        os.remove('.auth_success')
-                        st.session_state.authenticated = False
-        except Exception as e:
-            print(f"Error checking auth token: {str(e)}")
-            if os.path.exists('.auth_success'):
-                os.remove('.auth_success')
-            st.session_state.authenticated = False
-    
-    # Initialize other session state variables
-    if 'processing_complete' not in st.session_state:
-        st.session_state.processing_complete = False
-    
     if 'chat_messages' not in st.session_state:
         st.session_state.chat_messages = []
-    
+    if 'processing_complete' not in st.session_state:
+        st.session_state.processing_complete = False
     if 'processing_status' not in st.session_state:
         st.session_state.processing_status = None
+    if 'paused' not in st.session_state:
+        st.session_state.paused = False
+    if 'processor' not in st.session_state:
+        st.session_state.processor = None
+    
+    # Only verify token if not already authenticated and not in a paused state
+    if not st.session_state.authenticated and not st.session_state.paused:
+        if os.path.exists('.auth_success'):
+            try:
+                with open('.auth_success', 'r') as f:
+                    auth_data = json.load(f)
+                    if auth_data.get('access_token'):
+                        headers = {
+                            'Authorization': f'Bearer {auth_data["access_token"]}',
+                            'Accept': 'application/json',
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Origin': 'https://api.shoeboxed.com',
+                            'Referer': 'https://api.shoeboxed.com/',
+                            'Accept-Language': 'en-US,en;q=0.9'
+                        }
+                        response = requests.get('https://api.shoeboxed.com/v2/user', headers=headers)
+                        print(f"Verification response: {response.status_code}")
+                        print(f"Response headers: {dict(response.headers)}")
+                        print(f"Response body: {response.text}")
+                        
+                        if response.status_code == 200:
+                            st.session_state.authenticated = True
+                            print("Successfully verified existing auth token")
+                        else:
+                            print(f"Token verification failed: {response.status_code}")
+                            print(f"Response: {response.text}")
+                            os.remove('.auth_success')
+                            st.session_state.authenticated = False
+            except Exception as e:
+                print(f"Error checking auth token: {str(e)}")
+                if os.path.exists('.auth_success'):
+                    os.remove('.auth_success')
+                st.session_state.authenticated = False
 
 def init_pinecone():
     """Initialize Pinecone client"""
@@ -1218,225 +1187,46 @@ class ProcessingStats:
         total_processed = self.processed_count + self.failed_count + self.skipped_count
         return (total_processed / self.total_documents) * 100
 
-@dataclass
-class ProcessingResult:
-    doc_id: str
-    success: bool
-    error: Optional[str] = None
-    processing_time: float = 0.0
-
-class DocumentProcessor:
-    def __init__(self, tokens, checkpoint):
-        self.tokens = tokens
-        self.checkpoint = checkpoint
-        self.processing_queue = queue.Queue()
-        self.results_queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.metrics = {
-            'processed': 0,
-            'failed': 0,
-            'skipped': 0,
-            'total_time': 0.0,
-            'start_time': time.time()
-        }
-        self.lock = threading.Lock()
-
-    def update_progress_display(self, progress_bar, status_text, metrics_cols, completed, total):
-        """Update all progress displays atomically"""
-        with self.lock:
-            # Update progress bar
-            progress = completed / total if total > 0 else 0
-            progress_bar.progress(progress)
-            
-            # Calculate processing rate and ETA
-            elapsed_time = time.time() - self.metrics['start_time']
-            rate = completed / elapsed_time if elapsed_time > 0 else 0
-            remaining = total - completed
-            eta_minutes = remaining / (rate * 60) if rate > 0 else 0
-            
-            # Update metrics
-            metrics_cols[0].metric("Processed", self.metrics['processed'])
-            metrics_cols[1].metric("Failed", self.metrics['failed'])
-            metrics_cols[2].metric("Rate", f"{rate:.1f}/s")
-            metrics_cols[3].metric("ETA", f"{eta_minutes:.1f}m")
-            
-            # Update status text
-            status_text.text(f"Progress: {completed}/{total} ({progress:.1%}) • {rate:.1f} docs/s • {eta_minutes:.1f}m remaining")
-
-    def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
-        """Process a batch of documents with real-time progress updates"""
-        total = len(documents)
-        completed = 0
-        
-        # Initialize queues
-        for doc_id in documents:
-            if not self.checkpoint.should_process_doc(doc_id):
-                with self.lock:
-                    self.metrics['skipped'] += 1
-                    completed += 1
-                continue
-            
-            # Get full document details
-            account_id = get_organization_id(self.tokens['access_token'])
-            doc_details = fetch_document_details(account_id, doc_id, self.tokens['access_token'])
-            if doc_details:
-                self.processing_queue.put(doc_details)
-        
-        # Process documents
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for _ in range(min(MAX_WORKERS, self.processing_queue.qsize())):
-                futures.append(executor.submit(self.process_document_worker))
-            
-            # Monitor results and update progress
-            while completed < total:
-                try:
-                    result = self.results_queue.get(timeout=1.0)
-                    completed += 1
-                    
-                    # Update recent files list (keep only last 10)
-                    if len(recent_files) >= 10:
-                        recent_files.pop(0)
-                    recent_files.append(
-                        f"✅ {result.doc_id} ({time.strftime('%H:%M:%S')})"
-                    )
-                    
-                    # Update recent activity display with compact format
-                    recent_activity.markdown("\n".join(recent_files))
-                    
-                    # Update progress displays
-                    progress = completed / total
-                    progress_bar.progress(progress)
-                    
-                    # Calculate processing rate and ETA
-                    elapsed_time = time.time() - self.metrics['start_time']
-                    rate = completed / elapsed_time if elapsed_time > 0 else 0
-                    remaining = total - completed
-                    eta_minutes = remaining / (rate * 60) if rate > 0 else 0
-                    
-                    # Update metrics
-                    metrics_cols[0].metric("✅ Total Processed", self.metrics['processed'])
-                    metrics_cols[1].metric("❌ Failed", self.metrics['failed'])
-                    metrics_cols[2].metric("⏭️ Skipped", self.metrics['skipped'])
-                    metrics_cols[3].metric("🔄 Processing", remaining)
-                    
-                    # Update status text
-                    status_text.text(
-                        f"Progress: {completed}/{total} ({progress:.1%}) • "
-                        f"{rate:.1f} docs/s • {eta_minutes:.1f}m remaining"
-                    )
-                    
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logging.error(f"Error monitoring progress: {str(e)}")
-            
-            # Wait for all workers to complete
-            concurrent.futures.wait(futures)
-
-    def process_document_worker(self):
-        while not self.stop_event.is_set():
-            try:
-                doc = self.processing_queue.get_nowait()
-                if not isinstance(doc, dict) or 'id' not in doc:
-                    print(f"⚠️ Invalid document format: {doc}")
-                    continue
-            except queue.Empty:
-                break
-
-            start_time = time.time()
-            try:
-                # Load fresh tokens for each document
-                current_tokens = load_tokens()
-                if not current_tokens:
-                    raise Exception("Failed to load tokens")
-                    
-                success = process_single_document(doc, current_tokens, self.checkpoint)
-                processing_time = time.time() - start_time
-                
-                result = ProcessingResult(
-                    doc_id=doc['id'],
-                    success=success,
-                    processing_time=processing_time
-                )
-                
-                with self.lock:
-                    if success:
-                        self.metrics['processed'] += 1
-                    else:
-                        self.metrics['failed'] += 1
-                    self.metrics['total_time'] += processing_time
-                
-            except Exception as e:
-                print(f"❌ Error processing document {doc.get('id', 'Unknown')}: {str(e)}")
-                result = ProcessingResult(
-                    doc_id=doc.get('id', 'Unknown'),
-                    success=False,
-                    error=str(e),
-                    processing_time=time.time() - start_time
-                )
-                
-                with self.lock:
-                    self.metrics['failed'] += 1
-                    self.metrics['total_time'] += time.time() - start_time
-
-            self.results_queue.put(result)
-            time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
-
 def process_documents():
-    """Process documents from Shoeboxed using parallel processing"""
+    """Process documents from Shoeboxed in batches"""
     try:
-        # Initialize checkpoint system
-        checkpoint = ProcessingCheckpoint()
-        print("\n📋 Loading checkpoint...", flush=True)
-        
-        # Create metrics columns at the top
-        col1, col2, col3, col4 = st.columns(4)
-        
-        # Create progress bar and status
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Create collapsible section for recent activity
-        with st.expander("Recent Processing Activity (Last 10 Documents)", expanded=False):
-            recent_activity = st.empty()
-            recent_files = []  # Keep track of 10 most recent files
-        
-        print("\n🔍 Starting document processing with parallel execution...", flush=True)
-        
-        # Record start time
-        start_time = time.time()
+        print("\n🔍 DEBUG: Starting document processing...", flush=True)
         
         # Load tokens and ensure we have access token
-        print("\n🔑 Loading tokens...", flush=True)
+        print("\n🔑 DEBUG: Loading tokens...", flush=True)
         tokens = load_tokens()
         if not tokens or 'access_token' not in tokens:
             st.error("No valid Shoeboxed access token found. Please authenticate first.")
             return
-        
-        # Store access token in environment
+            
+        # Store access token in environment for other functions to use
         os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
-        # Refresh token if needed
+        # Add token refresh before starting main processing
         tokens = refresh_if_needed(tokens)
         if not tokens:
             st.error("Failed to refresh token. Please authenticate again.")
             return
-        
-        # Update access token in environment
+            
+        # Update access token in environment after refresh
         os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
         
         # Get organization ID
-        print("\n🏢 Getting organization ID...", flush=True)
         account_id = get_organization_id(tokens['access_token'])
-        print(f"   Organization ID: {account_id}", flush=True)
-        
-        # Initialize processor
-        processor = DocumentProcessor(tokens, checkpoint)
+        if not account_id:
+            st.error("Failed to get organization ID")
+            return
+            
+        # Set up UI elements for progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        metrics_cols = st.columns(3)
+        recent_activity = st.empty()
+        recent_files = st.empty()
         
         # Retrieve document IDs
-        print("\n🔍 Retrieving document IDs...", flush=True)
-        all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
+        print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
+        all_document_ids = retrieve_all_document_ids(tokens, st.session_state.processor.checkpoint)
         total_documents = len(all_document_ids)
         
         if total_documents == 0:
@@ -1444,55 +1234,71 @@ def process_documents():
             st.success("All documents have been processed!")
             return
         
-        # Initialize processing stats
-        stats = ProcessingStats()
-        stats.total_documents = total_documents
+        print(f"\n📊 Processing Summary:")
+        print(f"{'='*80}")
+        print(f"Total Documents Found: {total_documents:,}")
+        print(f"Already in Pinecone: {len(st.session_state.processor.checkpoint.processed_docs):,}")
+        print(f"Failed Previously: {len(st.session_state.processor.checkpoint.failed_docs):,}")
+        print(f"Skipped: {len(st.session_state.processor.checkpoint.skipped_docs):,}")
+        print(f"To Be Processed: {total_documents - len(st.session_state.processor.checkpoint.processed_docs):,}")
+        print(f"{'='*80}\n")
         
-        try:
-            # Process documents in batches
-            for batch_start in range(0, total_documents, BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, total_documents)
-                current_batch = all_document_ids[batch_start:batch_end]
+        # Process documents in batches
+        batch_size = 10
+        total_batches = (total_documents + batch_size - 1) // batch_size
+        
+        for batch_index in range(total_batches):
+            if st.session_state.paused:
+                status_text.text("Processing paused...")
+                time.sleep(1)
+                continue
                 
-                # Process the batch
-                processor.process_batch(
-                    current_batch,
-                    progress_bar,
-                    status_text,
-                    [col1, col2, col3, col4],
-                    recent_activity,
-                    recent_files
-                )
+            # Refresh token at the start of each batch
+            tokens = refresh_if_needed(tokens)
+            if not tokens:
+                st.error("Failed to refresh token. Please authenticate again.")
+                return
+            
+            # Update access token in environment
+            os.environ['SHOEBOXED_ACCESS_TOKEN'] = tokens['access_token']
+            
+            start_idx = batch_index * batch_size
+            end_idx = min(start_idx + batch_size, total_documents)
+            current_batch = all_document_ids[start_idx:end_idx]
+            
+            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
+            print(f"   Documents {start_idx + 1} to {end_idx} of {total_documents}")
+            
+            # Get document details for the batch
+            batch_documents = []
+            for doc_id in current_batch:
+                doc_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}"
+                response = requests.get(doc_url, headers=get_shoeboxed_headers(tokens['access_token']))
                 
-                # Update main progress display
-                progress = (batch_start + BATCH_SIZE) / total_documents
-                progress_bar.progress(min(progress, 1.0))
-                
-                # Update metrics
-                col1.metric("✅ Total Processed", processor.metrics['processed'] + len(checkpoint.processed_docs))
-                col2.metric("❌ Failed", processor.metrics['failed'] + len(checkpoint.failed_docs))
-                col3.metric("⏭️ Skipped", processor.metrics['skipped'] + len(checkpoint.skipped_docs))
-                
-                # Calculate rate and ETA
-                elapsed_time = time.time() - start_time
-                rate = processor.metrics['processed'] / elapsed_time if elapsed_time > 0 else 0
-                remaining = total_documents - (batch_start + BATCH_SIZE)
-                eta_minutes = remaining / (rate * 60) if rate > 0 else 0
-                
-                # Update status text with rate and ETA
-                status_text.text(
-                    f"Processing: {batch_start + BATCH_SIZE}/{total_documents} "
-                    f"({progress:.1%}) • {rate:.1f} docs/s • {eta_minutes:.1f}m remaining"
-                )
-                
-        except Exception as e:
-            st.error(f"Error during processing: {str(e)}")
-            logging.error(f"Processing error: {str(e)}")
-            logging.error(traceback.format_exc())
-        finally:
-            # Ensure final progress is shown
-            progress_bar.progress(1.0)
-            status_text.text("Processing complete!")
+                if response.status_code == 200:
+                    doc_data = response.json()
+                    batch_documents.append(doc_data)
+                else:
+                    print(f"❌ Failed to get document details for {doc_id}. Status: {response.status_code}")
+                    continue
+            
+            # Process the batch using DocumentProcessor
+            st.session_state.processor.process_batch(
+                batch_documents,
+                progress_bar,
+                status_text,
+                metrics_cols,
+                recent_activity,
+                recent_files
+            )
+            
+            # Save checkpoint after each batch
+            st.session_state.processor.checkpoint.update_batch(batch_index)
+            st.session_state.processor.checkpoint.save_checkpoint()
+        
+        # Final progress update
+        progress_bar.progress(1.0)
+        status_text.text("Processing complete!")
         
         print("\n✅ Document processing complete!")
         
@@ -1745,6 +1551,42 @@ def main():
         # Load checkpoint data immediately after login
         checkpoint = ProcessingCheckpoint()
         
+        # Add processing controls with pause/resume
+        col1, col2, col3 = st.sidebar.columns(3)
+        
+        if col1.button("📄 Process"):
+            st.session_state.paused = False
+            st.session_state.processor = DocumentProcessor()
+            st.session_state.processor.checkpoint = checkpoint
+            process_documents()
+            
+        if col2.button("⏸️ Pause" if not st.session_state.paused else "▶️ Resume"):
+            st.session_state.paused = not st.session_state.paused
+            st.sidebar.info("Processing paused" if st.session_state.paused else "Processing resumed")
+            
+        if col3.button("🔄 Reset"):
+            with st.spinner("Resetting all processing state..."):
+                if reset_processing_state():
+                    st.success("Reset complete! Ready for fresh document processing.")
+                else:
+                    st.error("Error during reset. Please check the logs.")
+        
+        # Add chat interface button
+        if st.sidebar.button("💬 Chat with Documents"):
+            chat_interface()
+        
+        # Add logout button
+        if st.sidebar.button("🚪 Logout"):
+            if os.path.exists('.auth_success'):
+                os.remove('.auth_success')
+            st.session_state.authenticated = False
+            st.session_state.chat_messages = []
+            st.session_state.processing_complete = False
+            st.session_state.paused = False
+            if hasattr(st.session_state, 'processor'):
+                delattr(st.session_state, 'processor')
+            st.rerun()
+        
         # Display processing statistics in the main area
         col1, col2, col3 = st.columns(3)
         col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
@@ -1761,57 +1603,9 @@ def main():
                     st.text(f"  Reason: {reason}")
                     st.text(f"  Retry attempts: {retries}")
         
-        # Add reset control
-        if st.sidebar.button("🔄 Reset Processing"):
-            with st.spinner("Resetting all processing state..."):
-                if reset_processing_state():
-                    st.success("Reset complete! Ready for fresh document processing.")
-                else:
-                    st.error("Error during reset. Please check the logs.")
-        
-        # Add processing controls
-        if st.sidebar.button("📄 Process Documents"):
-            with st.spinner("Processing documents..."):
-                process_documents()
-            
-        # Add chat interface
-        if st.sidebar.button("💬 Chat with Documents"):
-            chat_interface()
-        
-        # Add logout button
-        if st.sidebar.button("🚪 Logout"):
-            if os.path.exists('.auth_success'):
-                os.remove('.auth_success')
-            st.session_state.authenticated = False
-            st.session_state.chat_messages = []
-            st.session_state.processing_complete = False
-            st.rerun()
-        
         # Show processing status if available
         if hasattr(st.session_state, 'processing_status'):
             st.write(st.session_state.processing_status)
-        
-        if 'authenticated' in st.session_state and st.session_state.authenticated:
-            # Display processing metrics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Documents Processed", st.session_state.get('processed_count', 0))
-            with col2:
-                st.metric("Total Documents", st.session_state.get('total_count', 0))
-            with col3:
-                progress_pct = st.session_state.get('progress', 0.0) * 100
-                st.metric("Progress", f"{progress_pct:.1f}%")
-            
-            # Progress bar
-            st.progress(st.session_state.get('progress', 0.0))
-            
-            # Current file indicator
-            if current_file := st.session_state.get('current_file'):
-                st.text(f"Currently processing: {current_file}")
-            
-            # Process documents button
-            if st.button("Process Documents"):
-                process_documents()
 
 # Add cleanup on app exit
 def on_shutdown():
@@ -1909,7 +1703,7 @@ def upsert_to_pinecone(document_id, text_embedding, metadata):
 
 def fetch_document_details(account_id, doc_id, access_token):
     """
-    Fetch detailed information about a specific document
+    Fetch detailed information for a specific document using Shoeboxed V2 API.
     
     Args:
         account_id (str): Shoeboxed account ID
@@ -1932,7 +1726,7 @@ def fetch_document_details(account_id, doc_id, access_token):
     }
     
     try:
-        # Get document details
+        # First get document details
         response = requests.get(endpoint, headers=headers, timeout=10)
         
         if response.status_code == 200:
@@ -1943,6 +1737,58 @@ def fetch_document_details(account_id, doc_id, access_token):
             print("=" * 80)
             print(json.dumps(doc_data, indent=2))
             print("=" * 80)
+            
+            # Now get the download URL based on document type
+            download_endpoint = None
+            if doc_type == 'receipt':
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/receipts/{doc_id}/download"
+            elif doc_type == 'business-card':
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/business-cards/{doc_id}/download"
+            else:
+                download_endpoint = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents/{doc_id}/download"
+            
+            print(f"Checking download URL: {download_endpoint}")
+            
+            # Make a HEAD request to verify the download URL
+            download_headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/pdf,image/*',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            
+            try:
+                download_response = requests.head(
+                    download_endpoint,
+                    headers=download_headers,
+                    allow_redirects=True,
+                    timeout=10
+                )
+                
+                print(f"Download response status: {download_response.status_code}")
+                print(f"Download response headers: {dict(download_response.headers)}")
+                
+                if download_response.status_code in [200, 302]:
+                    # For S3 URLs, get the Location header from the redirect
+                    if download_response.status_code == 302:
+                        actual_download_url = download_response.headers.get('Location')
+                        print(f"🔄 Redirected to: {actual_download_url}")
+                        doc_data['attachment'] = {
+                            'url': actual_download_url,
+                            'name': f"{doc_type}_{doc_id}.pdf"
+                        }
+                    else:
+                        doc_data['attachment'] = {
+                            'url': download_endpoint,
+                            'name': f"{doc_type}_{doc_id}.pdf"
+                        }
+                    print(f"✅ Successfully added download URL to document {doc_id}")
+                else:
+                    print(f"❌ Failed to verify download URL for document {doc_id}")
+                    print(f"Response status: {download_response.status_code}")
+                    print(f"Response headers: {download_response.headers}")
+            except Exception as e:
+                print(f"❌ Error checking download URL: {str(e)}")
+                print(f"Traceback: {traceback.format_exc()}")
             
             # Add account ID to document data
             doc_data['accountId'] = account_id
@@ -2037,106 +1883,173 @@ def should_retry_error(error_category, retry_count):
     }
     return retry_count < max_retries.get(error_category, 3)
 
-class ResourceManager:
-    """Context manager for handling temporary resources"""
+class ProcessingResult:
+    def __init__(self, doc_id, success, processing_time, error=None):
+        self.doc_id = doc_id
+        self.success = success
+        self.processing_time = processing_time
+        self.error = error
+
+class DocumentProcessor:
     def __init__(self):
-        self.temp_files = []
-        self.temp_dirs = []
-    
-    def add_temp_file(self, filepath):
-        self.temp_files.append(filepath)
-        return filepath
-    
-    def add_temp_dir(self, dirpath):
-        self.temp_dirs.append(dirpath)
-        return dirpath
-    
-    def cleanup(self):
-        """Clean up all temporary resources"""
-        for filepath in self.temp_files:
-            try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            except Exception as e:
-                print(f"⚠️ Error removing temporary file {filepath}: {str(e)}")
+        self.processing_queue = queue.Queue()
+        self.results_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.checkpoint = ProcessingCheckpoint()
+        self.metrics = {
+            'processed': 0,
+            'failed': 0,
+            'total_time': 0
+        }
         
-        for dirpath in self.temp_dirs:
+    def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
+        """Process a batch of documents using multiple threads"""
+        try:
+            # Reset metrics
+            self.metrics = {
+                'processed': 0,
+                'failed': 0,
+                'total_time': 0
+            }
+            
+            # Fill the queue with documents
+            for doc in documents:
+                self.processing_queue.put(doc)
+            
+            # Create and start worker threads
+            num_threads = min(MAX_THREADS, len(documents))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = []
+                for _ in range(num_threads):
+                    futures.append(executor.submit(self.process_document_worker))
+                
+                # Monitor progress while threads are running
+                while any(not f.done() for f in futures):
+                    try:
+                        # Check for pause state
+                        if st.session_state.get('paused', False):
+                            status_text.text("Processing paused...")
+                            time.sleep(1)
+                            continue
+                            
+                        # Process results from the queue
+                        self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                        time.sleep(0.1)
+                    except Exception as e:
+                        print(f"Error in progress monitoring: {str(e)}")
+                        continue
+                
+                # Process any remaining results
+                self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                
+                # Wait for all workers to complete
+                concurrent.futures.wait(futures)
+                
+        except Exception as e:
+            print(f"Error in process_batch: {str(e)}")
+            print(traceback.format_exc())
+    
+    def process_document_worker(self):
+        """Worker thread for processing documents"""
+        while not self.stop_event.is_set():
             try:
-                if os.path.exists(dirpath):
-                    shutil.rmtree(dirpath)
+                # Check for pause state
+                if st.session_state.get('paused', False):
+                    time.sleep(1)  # Sleep briefly to reduce CPU usage
+                    continue
+                    
+                try:
+                    doc = self.processing_queue.get_nowait()
+                    if not isinstance(doc, dict) or 'id' not in doc:
+                        print(f"⚠️ Invalid document format: {doc}")
+                        continue
+                except queue.Empty:
+                    break
+                
+                start_time = time.time()
+                try:
+                    # Load fresh tokens for each document
+                    current_tokens = load_tokens()
+                    if not current_tokens:
+                        raise Exception("Failed to load tokens")
+                        
+                    success = process_single_document(doc, current_tokens, self.checkpoint)
+                    processing_time = time.time() - start_time
+                    
+                    result = ProcessingResult(
+                        doc_id=doc['id'],
+                        success=success,
+                        processing_time=processing_time
+                    )
+                    
+                    with self.lock:
+                        if success:
+                            self.metrics['processed'] += 1
+                        else:
+                            self.metrics['failed'] += 1
+                        self.metrics['total_time'] += processing_time
+                    
+                except Exception as e:
+                    print(f"❌ Error processing document {doc.get('id', 'Unknown')}: {str(e)}")
+                    result = ProcessingResult(
+                        doc_id=doc.get('id', 'Unknown'),
+                        success=False,
+                        processing_time=time.time() - start_time,
+                        error=str(e)
+                    )
+                    
+                    with self.lock:
+                        self.metrics['failed'] += 1
+                        self.metrics['total_time'] += time.time() - start_time
+                    
+                self.results_queue.put(result)
+                time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
+                
             except Exception as e:
-                print(f"⚠️ Error removing temporary directory {dirpath}: {str(e)}")
+                print(f"Error in worker thread: {str(e)}")
+                print(traceback.format_exc())
+                continue
     
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-
-def process_large_pdf(pdf_bytes, chunk_size=10):
-    """Process large PDFs in chunks to manage memory"""
-    try:
-        # Convert PDF to images
-        with ResourceManager() as rm:
-            # Create temporary directory for image chunks
-            temp_dir = rm.add_temp_dir(tempfile.mkdtemp())
-            
-            # Convert PDF to images in chunks
-            images = []
-            pdf_stream = BytesIO(pdf_bytes)
-            
-            # Get total number of pages
-            pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-            total_pages = pdf.page_count
-            pdf.close()
-            
-            # Process in chunks
-            extracted_texts = []
-            for start_page in range(0, total_pages, chunk_size):
-                end_page = min(start_page + chunk_size, total_pages)
+    def _process_results(self, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
+        """Process results from the results queue and update UI"""
+        try:
+            while True:
+                try:
+                    result = self.results_queue.get_nowait()
+                except queue.Empty:
+                    break
                 
-                # Convert chunk to images
-                chunk_images = convert_from_bytes(
-                    pdf_bytes,
-                    first_page=start_page + 1,
-                    last_page=end_page
-                )
+                # Update progress bar
+                total_processed = self.metrics['processed'] + self.metrics['failed']
+                total_docs = total_processed + self.processing_queue.qsize()
+                if total_docs > 0:
+                    progress = total_processed / total_docs
+                    progress_bar.progress(progress)
                 
-                # Process each image in the chunk
-                chunk_texts = []
-                for i, image in enumerate(chunk_images):
-                    page_num = start_page + i + 1
-                    text = process_page_with_retry(page_num, image)
-                    if text:
-                        chunk_texts.append(text)
+                # Update status text
+                status = "Paused" if st.session_state.get('paused', False) else "Processing"
+                status_text.text(f"{status}: {total_processed} of {total_docs} documents")
                 
-                # Clear chunk images from memory
-                del chunk_images
-                gc.collect()
+                # Update metrics
+                metrics_cols[0].metric("Processed", self.metrics['processed'])
+                metrics_cols[1].metric("Failed", self.metrics['failed'])
+                if self.metrics['total_time'] > 0:
+                    rate = total_processed / self.metrics['total_time']
+                    metrics_cols[2].metric("Rate", f"{rate:.1f} docs/sec")
                 
-                extracted_texts.extend(chunk_texts)
-            
-            return "\n\n".join(extracted_texts)
-    
-    except Exception as e:
-        print(f"❌ Error processing large PDF: {str(e)}")
-        return None
-
-def update_progress(state, processed_count, total_count, current_file=None):
-    """Update progress metrics in the Streamlit state"""
-    if 'progress' not in state:
-        state.progress = 0.0
-    
-    # Update progress percentage
-    state.progress = float(processed_count) / float(total_count) if total_count > 0 else 0.0
-    
-    # Update metrics in session state
-    state.processed_count = processed_count
-    state.total_count = total_count
-    state.current_file = current_file
-    
-    # Force a rerun to update the UI
-    st.experimental_rerun()
+                # Update recent activity
+                if result.success:
+                    recent_activity.info(f"✅ Processed document {result.doc_id}")
+                else:
+                    recent_activity.error(f"❌ Failed document {result.doc_id}: {result.error}")
+                
+                # Update recent files
+                recent_files.text(f"Last processed: {result.doc_id}")
+                
+        except Exception as e:
+            print(f"Error processing results: {str(e)}")
+            print(traceback.format_exc())
 
 if __name__ == "__main__":
     main()
