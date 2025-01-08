@@ -1338,12 +1338,20 @@ class DocumentProcessor:
         while not self.stop_event.is_set():
             try:
                 doc = self.processing_queue.get_nowait()
+                if not isinstance(doc, dict) or 'id' not in doc:
+                    print(f"⚠️ Invalid document format: {doc}")
+                    continue
             except queue.Empty:
                 break
 
             start_time = time.time()
             try:
-                success = process_single_document(doc, self.tokens, self.checkpoint)
+                # Load fresh tokens for each document
+                current_tokens = load_tokens()
+                if not current_tokens:
+                    raise Exception("Failed to load tokens")
+                    
+                success = process_single_document(doc, current_tokens, self.checkpoint)
                 processing_time = time.time() - start_time
                 
                 result = ProcessingResult(
@@ -1360,8 +1368,9 @@ class DocumentProcessor:
                     self.metrics['total_time'] += processing_time
                 
             except Exception as e:
+                print(f"❌ Error processing document {doc.get('id', 'Unknown')}: {str(e)}")
                 result = ProcessingResult(
-                    doc_id=doc['id'],
+                    doc_id=doc.get('id', 'Unknown'),
                     success=False,
                     error=str(e),
                     processing_time=time.time() - start_time
