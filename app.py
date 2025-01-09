@@ -1302,10 +1302,20 @@ def process_documents():
         
         print("\n✅ Document processing complete!")
         
+        # Clean up processor after completion
+        if hasattr(st.session_state, 'processor'):
+            delattr(st.session_state, 'processor')
+        st.session_state.paused = False
+        
     except Exception as e:
         print(f"❌ Error in document processing: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         st.error(f"An error occurred during processing: {str(e)}")
+        
+        # Clean up processor on error
+        if hasattr(st.session_state, 'processor'):
+            delattr(st.session_state, 'processor')
+        st.session_state.paused = False
         raise
 
 def chat_interface():
@@ -1554,17 +1564,36 @@ def main():
         # Add processing controls with pause/resume
         col1, col2, col3 = st.sidebar.columns(3)
         
-        if col1.button("📄 Process"):
+        # Check if processing is active (when processor exists and documents are being processed)
+        processing_active = (
+            hasattr(st.session_state, 'processor') and 
+            hasattr(st.session_state.processor, 'processing_queue')
+        )
+        
+        if col1.button("📄 Process", disabled=processing_active):
+            # Clean up any existing processor
+            if hasattr(st.session_state, 'processor'):
+                delattr(st.session_state, 'processor')
             st.session_state.paused = False
             st.session_state.processor = DocumentProcessor()
             st.session_state.processor.checkpoint = checkpoint
             process_documents()
+        
+        # Only show pause/resume button if processing is active
+        if processing_active:
+            pause_button_label = "⏸️ Pause" if not st.session_state.get('paused', False) else "▶️ Resume"
+            if col2.button(pause_button_label):
+                st.session_state.paused = not st.session_state.get('paused', False)
+                if st.session_state.paused:
+                    st.sidebar.warning("Processing paused")
+                else:
+                    st.sidebar.success("Processing resumed")
+                st.rerun()  # Force UI update
+        else:
+            # Show disabled button when not processing
+            col2.button("⏸️ Pause", disabled=True)
             
-        if col2.button("⏸️ Pause" if not st.session_state.paused else "▶️ Resume"):
-            st.session_state.paused = not st.session_state.paused
-            st.sidebar.info("Processing paused" if st.session_state.paused else "Processing resumed")
-            
-        if col3.button("🔄 Reset"):
+        if col3.button("🔄 Reset", disabled=processing_active and not st.session_state.get('paused', False)):
             with st.spinner("Resetting all processing state..."):
                 if reset_processing_state():
                     st.success("Reset complete! Ready for fresh document processing.")
@@ -1929,10 +1958,10 @@ class DocumentProcessor:
                     try:
                         # Check for pause state
                         if st.session_state.get('paused', False):
-                            status_text.text("Processing paused...")
-                            time.sleep(1)
+                            status_text.text("⏸️ Processing paused...")
+                            time.sleep(0.5)  # Reduced sleep time for more responsive resume
                             continue
-                            
+                        
                         # Process results from the queue
                         self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
                         time.sleep(0.1)
@@ -1956,15 +1985,17 @@ class DocumentProcessor:
             try:
                 # Check for pause state
                 if st.session_state.get('paused', False):
-                    time.sleep(1)  # Sleep briefly to reduce CPU usage
+                    time.sleep(0.5)  # Reduced sleep time for more responsive resume
                     continue
-                    
+                
+                # Try to get a document from the queue
                 try:
                     doc = self.processing_queue.get_nowait()
                     if not isinstance(doc, dict) or 'id' not in doc:
                         print(f"⚠️ Invalid document format: {doc}")
                         continue
                 except queue.Empty:
+                    # No more documents to process
                     break
                 
                 start_time = time.time()
@@ -1973,7 +2004,7 @@ class DocumentProcessor:
                     current_tokens = load_tokens()
                     if not current_tokens:
                         raise Exception("Failed to load tokens")
-                        
+                    
                     success = process_single_document(doc, current_tokens, self.checkpoint)
                     processing_time = time.time() - start_time
                     
@@ -2002,7 +2033,7 @@ class DocumentProcessor:
                     with self.lock:
                         self.metrics['failed'] += 1
                         self.metrics['total_time'] += time.time() - start_time
-                    
+                
                 self.results_queue.put(result)
                 time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
                 
@@ -2028,15 +2059,16 @@ class DocumentProcessor:
                     progress_bar.progress(progress)
                 
                 # Update status text
-                status = "Paused" if st.session_state.get('paused', False) else "Processing"
+                is_paused = st.session_state.get('paused', False)
+                status = "⏸️ Paused" if is_paused else "🔄 Processing"
                 status_text.text(f"{status}: {total_processed} of {total_docs} documents")
                 
-                # Update metrics
-                metrics_cols[0].metric("Processed", self.metrics['processed'])
-                metrics_cols[1].metric("Failed", self.metrics['failed'])
+                # Update metrics with paused state
+                metrics_cols[0].metric("✅ Processed", self.metrics['processed'])
+                metrics_cols[1].metric("❌ Failed", self.metrics['failed'])
                 if self.metrics['total_time'] > 0:
                     rate = total_processed / self.metrics['total_time']
-                    metrics_cols[2].metric("Rate", f"{rate:.1f} docs/sec")
+                    metrics_cols[2].metric("⚡ Rate", f"{rate:.1f} docs/sec")
                 
                 # Update recent activity
                 if result.success:
