@@ -1197,6 +1197,7 @@ def process_documents():
         tokens = load_tokens()
         if not tokens or 'access_token' not in tokens:
             st.error("No valid Shoeboxed access token found. Please authenticate first.")
+            st.session_state.processing_active = False
             return
             
         # Store access token in environment for other functions to use
@@ -1206,6 +1207,7 @@ def process_documents():
         tokens = refresh_if_needed(tokens)
         if not tokens:
             st.error("Failed to refresh token. Please authenticate again.")
+            st.session_state.processing_active = False
             return
             
         # Update access token in environment after refresh
@@ -1215,6 +1217,7 @@ def process_documents():
         account_id = get_organization_id(tokens['access_token'])
         if not account_id:
             st.error("Failed to get organization ID")
+            st.session_state.processing_active = False
             return
             
         # Set up UI elements for progress tracking
@@ -1232,6 +1235,7 @@ def process_documents():
         if total_documents == 0:
             print("✅ No new documents to process!")
             st.success("All documents have been processed!")
+            st.session_state.processing_active = False
             return
         
         print(f"\n📊 Processing Summary:")
@@ -1248,15 +1252,20 @@ def process_documents():
         total_batches = (total_documents + batch_size - 1) // batch_size
         
         for batch_index in range(total_batches):
+            if not st.session_state.processing_active:
+                print("Processing stopped.")
+                break
+                
             if st.session_state.paused:
-                status_text.text("Processing paused...")
-                time.sleep(1)
+                status_text.text("⏸️ Processing paused... Click Resume to continue")
+                time.sleep(0.5)  # Short sleep to prevent CPU spinning
                 continue
                 
             # Refresh token at the start of each batch
             tokens = refresh_if_needed(tokens)
             if not tokens:
                 st.error("Failed to refresh token. Please authenticate again.")
+                st.session_state.processing_active = False
                 return
             
             # Update access token in environment
@@ -1298,14 +1307,15 @@ def process_documents():
         
         # Final progress update
         progress_bar.progress(1.0)
-        status_text.text("Processing complete!")
+        status_text.text("✅ Processing complete!")
         
         print("\n✅ Document processing complete!")
         
         # Clean up processor after completion
+        st.session_state.processing_active = False
+        st.session_state.paused = False
         if hasattr(st.session_state, 'processor'):
             delattr(st.session_state, 'processor')
-        st.session_state.paused = False
         
     except Exception as e:
         print(f"❌ Error in document processing: {str(e)}")
@@ -1313,10 +1323,10 @@ def process_documents():
         st.error(f"An error occurred during processing: {str(e)}")
         
         # Clean up processor on error
+        st.session_state.processing_active = False
+        st.session_state.paused = False
         if hasattr(st.session_state, 'processor'):
             delattr(st.session_state, 'processor')
-        st.session_state.paused = False
-        raise
 
 def chat_interface():
     """Chat interface for interacting with processed documents"""
@@ -1561,59 +1571,86 @@ def main():
         # Load checkpoint data immediately after login
         checkpoint = ProcessingCheckpoint()
         
+        # Initialize processing state if not exists
+        if 'processing_active' not in st.session_state:
+            st.session_state.processing_active = False
+        if 'paused' not in st.session_state:
+            st.session_state.paused = False
+        
         # Add processing controls with pause/resume
         col1, col2, col3 = st.sidebar.columns(3)
         
-        # Check if processing is active (when processor exists and documents are being processed)
-        processing_active = (
-            hasattr(st.session_state, 'processor') and 
-            hasattr(st.session_state.processor, 'processing_queue')
-        )
+        # Check if processing is active
+        processing_active = hasattr(st.session_state, 'processor')
         
-        if col1.button("📄 Process", disabled=processing_active):
+        # Process button
+        if col1.button("📄 Process", disabled=False):  # Never disable Process button
             # Clean up any existing processor
             if hasattr(st.session_state, 'processor'):
                 delattr(st.session_state, 'processor')
             st.session_state.paused = False
+            st.session_state.processing_active = True
             st.session_state.processor = DocumentProcessor()
             st.session_state.processor.checkpoint = checkpoint
             process_documents()
         
-        # Only show pause/resume button if processing is active
+        # Pause/Resume button
         if processing_active:
             pause_button_label = "⏸️ Pause" if not st.session_state.get('paused', False) else "▶️ Resume"
-            if col2.button(pause_button_label):
-                st.session_state.paused = not st.session_state.get('paused', False)
-                if st.session_state.paused:
-                    st.sidebar.warning("Processing paused")
-                else:
-                    st.sidebar.success("Processing resumed")
-                st.rerun()  # Force UI update
+            if col2.button(pause_button_label, key="pause_resume_button"):
+                try:
+                    st.session_state.paused = not st.session_state.get('paused', False)
+                    if st.session_state.paused:
+                        st.sidebar.warning("Processing paused")
+                    else:
+                        st.sidebar.success("Processing resumed")
+                    time.sleep(0.1)  # Small delay to ensure state updates
+                    st.rerun()  # Updated from experimental_rerun()
+                except Exception as e:
+                    st.error(f"Error toggling pause state: {str(e)}")
+                    print(f"Error in pause/resume: {str(e)}")
+                    print(traceback.format_exc())
         else:
-            # Show disabled button when not processing
-            col2.button("⏸️ Pause", disabled=True)
-            
-        if col3.button("🔄 Reset", disabled=processing_active and not st.session_state.get('paused', False)):
-            with st.spinner("Resetting all processing state..."):
-                if reset_processing_state():
-                    st.success("Reset complete! Ready for fresh document processing.")
-                else:
-                    st.error("Error during reset. Please check the logs.")
+            # Show disabled pause button when not processing
+            col2.button("⏸️ Pause", disabled=True, key="pause_button_disabled")
         
-        # Add chat interface button
-        if st.sidebar.button("💬 Chat with Documents"):
+        # Reset button
+        if col3.button("🔄 Reset", disabled=processing_active and not st.session_state.get('paused', False)):
+            try:
+                if hasattr(st.session_state, 'processor'):
+                    st.session_state.processor.stop_event.set()
+                    delattr(st.session_state, 'processor')
+                st.session_state.paused = False
+                st.session_state.processing_active = False
+                time.sleep(0.1)  # Small delay to ensure state updates
+                st.rerun()  # Updated from experimental_rerun()
+            except Exception as e:
+                st.error(f"Error resetting processor: {str(e)}")
+                print(f"Error in reset: {str(e)}")
+                print(traceback.format_exc())
+        
+        # Chat interface button - enabled only when not processing
+        chat_button = st.sidebar.button(
+            "💬 Chat with Documents",
+            disabled=st.session_state.processing_active,
+            key="chat_button"
+        )
+        
+        if chat_button and not st.session_state.processing_active:
             chat_interface()
         
-        # Add logout button
-        if st.sidebar.button("🚪 Logout"):
+        # Logout button - enabled only when not processing
+        logout_button = st.sidebar.button(
+            "🚪 Logout",
+            disabled=st.session_state.processing_active,
+            key="logout_button"
+        )
+        
+        if logout_button and not st.session_state.processing_active:
             if os.path.exists('.auth_success'):
                 os.remove('.auth_success')
-            st.session_state.authenticated = False
-            st.session_state.chat_messages = []
-            st.session_state.processing_complete = False
-            st.session_state.paused = False
-            if hasattr(st.session_state, 'processor'):
-                delattr(st.session_state, 'processor')
+            # Clear all session state
+            st.session_state.clear()
             st.rerun()
         
         # Display processing statistics in the main area
@@ -1931,71 +1968,25 @@ class DocumentProcessor:
             'failed': 0,
             'total_time': 0
         }
-        
-    def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
-        """Process a batch of documents using multiple threads"""
-        try:
-            # Reset metrics
-            self.metrics = {
-                'processed': 0,
-                'failed': 0,
-                'total_time': 0
-            }
-            
-            # Fill the queue with documents
-            for doc in documents:
-                self.processing_queue.put(doc)
-            
-            # Create and start worker threads
-            num_threads = min(MAX_THREADS, len(documents))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = []
-                for _ in range(num_threads):
-                    futures.append(executor.submit(self.process_document_worker))
-                
-                # Monitor progress while threads are running
-                while any(not f.done() for f in futures):
-                    try:
-                        # Check for pause state
-                        if st.session_state.get('paused', False):
-                            status_text.text("⏸️ Processing paused...")
-                            time.sleep(0.5)  # Reduced sleep time for more responsive resume
-                            continue
-                        
-                        # Process results from the queue
-                        self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
-                        time.sleep(0.1)
-                    except Exception as e:
-                        print(f"Error in progress monitoring: {str(e)}")
-                        continue
-                
-                # Process any remaining results
-                self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
-                
-                # Wait for all workers to complete
-                concurrent.futures.wait(futures)
-                
-        except Exception as e:
-            print(f"Error in process_batch: {str(e)}")
-            print(traceback.format_exc())
     
     def process_document_worker(self):
         """Worker thread for processing documents"""
         while not self.stop_event.is_set():
             try:
-                # Check for pause state
-                if st.session_state.get('paused', False):
-                    time.sleep(0.5)  # Reduced sleep time for more responsive resume
+                # Check for pause state with proper thread safety
+                with self.lock:
+                    is_paused = st.session_state.get('paused', False)
+                
+                if is_paused:
+                    time.sleep(0.5)  # Short sleep to prevent CPU spinning
                     continue
                 
-                # Try to get a document from the queue
                 try:
                     doc = self.processing_queue.get_nowait()
                     if not isinstance(doc, dict) or 'id' not in doc:
                         print(f"⚠️ Invalid document format: {doc}")
                         continue
                 except queue.Empty:
-                    # No more documents to process
                     break
                 
                 start_time = time.time()
@@ -2041,6 +2032,54 @@ class DocumentProcessor:
                 print(f"Error in worker thread: {str(e)}")
                 print(traceback.format_exc())
                 continue
+
+    def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
+        """Process a batch of documents with real-time progress updates"""
+        try:
+            # Initialize processing queue
+            for doc in documents:
+                self.processing_queue.put(doc)
+            
+            # Create and start worker threads
+            num_threads = min(MAX_THREADS, len(documents))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = []
+                for _ in range(num_threads):
+                    futures.append(executor.submit(self.process_document_worker))
+                
+                # Monitor progress while threads are running
+                while any(not f.done() for f in futures):
+                    try:
+                        # Process results and update UI
+                        self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                        
+                        # Update status message based on pause state
+                        with self.lock:
+                            is_paused = st.session_state.get('paused', False)
+                        
+                        if is_paused:
+                            status_text.text("⏸️ Processing paused... Click Resume to continue")
+                        else:
+                            total_processed = self.metrics['processed'] + self.metrics['failed']
+                            total_docs = total_processed + self.processing_queue.qsize()
+                            if total_docs > 0:
+                                progress = total_processed / total_docs
+                                status_text.text(f"🔄 Processing: {total_processed}/{total_docs} ({progress:.1%})")
+                        
+                        time.sleep(0.1)
+                    except Exception as e:
+                        print(f"Error in progress monitoring: {str(e)}")
+                        continue
+                
+                # Process any remaining results
+                self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                
+                # Wait for all workers to complete
+                concurrent.futures.wait(futures)
+                
+        except Exception as e:
+            print(f"Error in process_batch: {str(e)}")
+            print(traceback.format_exc())
     
     def _process_results(self, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
         """Process results from the results queue and update UI"""
@@ -2059,11 +2098,15 @@ class DocumentProcessor:
                     progress_bar.progress(progress)
                 
                 # Update status text
-                is_paused = st.session_state.get('paused', False)
-                status = "⏸️ Paused" if is_paused else "🔄 Processing"
+                if st.session_state.paused:
+                    status = "⏸️ Paused"
+                elif not st.session_state.processing_active:
+                    status = "⛔ Stopped"
+                else:
+                    status = "🔄 Processing"
                 status_text.text(f"{status}: {total_processed} of {total_docs} documents")
                 
-                # Update metrics with paused state
+                # Update metrics
                 metrics_cols[0].metric("✅ Processed", self.metrics['processed'])
                 metrics_cols[1].metric("❌ Failed", self.metrics['failed'])
                 if self.metrics['total_time'] > 0:
