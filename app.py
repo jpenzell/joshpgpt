@@ -1261,18 +1261,57 @@ def process_documents():
             st.error("Failed to get organization ID")
             st.session_state.processing_active = False
             return
-            
+
+        # Create main title and description
+        st.title("Document Processing")
+        st.write("Processing documents from Shoeboxed and updating the knowledge base.")
+        
         # Set up UI elements for progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        metrics_cols = st.columns(3)
-        recent_activity = st.empty()
-        recent_files = st.empty()
+        progress_container = st.container()
+        with progress_container:
+            # Create metrics at the top
+            metrics_cols = st.columns(4)
+            total_metric = metrics_cols[0].empty()
+            processed_metric = metrics_cols[1].empty()
+            failed_metric = metrics_cols[2].empty()
+            skipped_metric = metrics_cols[3].empty()
+            
+            # Progress bar and status
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Recent activity (collapsible)
+            with st.expander("Recent Activity", expanded=False):
+                recent_activity = st.empty()
+                recent_files = st.empty()
+        
+        # Initialize checkpoint if not exists
+        if not hasattr(st.session_state, 'processor'):
+            st.session_state.processor = DocumentProcessor()
+        
+        # Get initial counts from checkpoint
+        checkpoint = st.session_state.processor.checkpoint
+        processed_count = len(checkpoint.processed_docs)
+        failed_count = len(checkpoint.failed_docs)
+        skipped_count = len(checkpoint.skipped_docs)
+        
+        # Update initial metrics with loading state
+        total_metric.metric("Total Documents", "Loading...")
+        processed_metric.metric("Processed", processed_count)
+        failed_metric.metric("Failed", failed_count)
+        skipped_metric.metric("Skipped", skipped_count)
         
         # Retrieve document IDs
         print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
-        all_document_ids = retrieve_all_document_ids(tokens, st.session_state.processor.checkpoint)
+        all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
+        
+        # Update total metric now that we have the count
+        total_metric.metric(
+            "Total Documents",
+            f"{total_documents + processed_count + skipped_count:,}",
+            f"{total_documents:,} to process"
+        )
         
         if total_documents == 0:
             print("✅ No new documents to process!")
@@ -1283,10 +1322,10 @@ def process_documents():
         print(f"\n📊 Processing Summary:")
         print(f"{'='*80}")
         print(f"Total Documents Found: {total_documents:,}")
-        print(f"Already in Pinecone: {len(st.session_state.processor.checkpoint.processed_docs):,}")
-        print(f"Failed Previously: {len(st.session_state.processor.checkpoint.failed_docs):,}")
-        print(f"Skipped: {len(st.session_state.processor.checkpoint.skipped_docs):,}")
-        print(f"To Be Processed: {total_documents - len(st.session_state.processor.checkpoint.processed_docs):,}")
+        print(f"Already in Pinecone: {processed_count:,}")
+        print(f"Failed Previously: {failed_count:,}")
+        print(f"Skipped: {skipped_count:,}")
+        print(f"To Be Processed: {total_documents:,}")
         print(f"{'='*80}\n")
         
         # Process documents in batches
@@ -1317,6 +1356,11 @@ def process_documents():
             end_idx = min(start_idx + batch_size, total_documents)
             current_batch = all_document_ids[start_idx:end_idx]
             
+            # Update progress
+            progress = (batch_index * batch_size) / total_documents
+            progress_bar.progress(min(progress, 1.0))
+            status_text.text(f"Processing batch {batch_index + 1} of {total_batches}")
+            
             print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
             print(f"   Documents {start_idx + 1} to {end_idx} of {total_documents}")
             
@@ -1343,9 +1387,35 @@ def process_documents():
                 recent_files
             )
             
+            # Update metrics after each batch
+            current_processed = len(checkpoint.processed_docs)
+            current_failed = len(checkpoint.failed_docs)
+            current_skipped = len(checkpoint.skipped_docs)
+            
+            total_metric.metric(
+                "Total Documents",
+                f"{total_documents + current_processed + current_skipped:,}",
+                f"{total_documents - (current_processed - processed_count):,} to process"
+            )
+            processed_metric.metric(
+                "Processed",
+                current_processed,
+                f"+{current_processed - processed_count}"
+            )
+            failed_metric.metric(
+                "Failed",
+                current_failed,
+                f"+{current_failed - failed_count}" if current_failed > failed_count else None
+            )
+            skipped_metric.metric(
+                "Skipped",
+                current_skipped,
+                f"+{current_skipped - skipped_count}" if current_skipped > skipped_count else None
+            )
+            
             # Save checkpoint after each batch
-            st.session_state.processor.checkpoint.update_batch(batch_index)
-            st.session_state.processor.checkpoint.save_checkpoint()
+            checkpoint.update_batch(batch_index)
+            checkpoint.save_checkpoint()
         
         # Final progress update
         progress_bar.progress(1.0)
