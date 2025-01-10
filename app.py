@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 import queue
 import concurrent.futures
+import re
 
 # Load environment variables
 load_dotenv()
@@ -1329,19 +1330,31 @@ def process_documents():
             delattr(st.session_state, 'processor')
 
 def chat_interface():
-    """Chat interface for interacting with processed documents"""
+    """Enhanced chat interface for second brain interaction"""
     # Initialize chat messages if not exists
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
+    if "context_depth" not in st.session_state:
+        st.session_state.context_depth = "standard"  # or "detailed" or "concise"
         
     try:
-        # Initialize Pinecone with logging
+        # Initialize Pinecone
         print("\n🔍 Initializing Pinecone connection...")
         index = init_pinecone()
         if not index:
-            st.error("Failed to initialize Pinecone. Please check your Pinecone configuration.")
+            st.error("Failed to initialize Pinecone. Please check your configuration.")
             return
         print("✅ Pinecone connection established")
+        
+        # Add context depth selector in sidebar
+        st.sidebar.write("### Chat Settings")
+        context_depth = st.sidebar.select_slider(
+            "Context Depth",
+            options=["concise", "standard", "detailed"],
+            value=st.session_state.context_depth,
+            help="Controls how much context is included in responses"
+        )
+        st.session_state.context_depth = context_depth
         
         # Display chat messages
         for message in st.session_state.chat_messages:
@@ -1357,6 +1370,26 @@ def chat_interface():
             with st.chat_message("user"):
                 st.markdown(prompt)
             
+            # Analyze query intent
+            print("🧠 Analyzing query intent...")
+            try:
+                intent_response = client.chat.completions.create(
+                    model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+                    messages=[{
+                        "role": "system",
+                        "content": "Analyze the query to determine: 1) Primary topic/intent, 2) Temporal context (if any), 3) Required document types, 4) Key entities to look for. Format as JSON."
+                    }, {
+                        "role": "user",
+                        "content": prompt
+                    }],
+                    temperature=0.2
+                )
+                query_intent = json.loads(intent_response.choices[0].message.content)
+                print(f"✅ Query intent analyzed: {query_intent}")
+            except Exception as e:
+                print(f"⚠️ Error analyzing intent: {str(e)}")
+                query_intent = {}
+            
             # Create embedding for the query
             print("🔄 Creating query embedding...")
             query_embedding = create_embedding(prompt)
@@ -1365,18 +1398,26 @@ def chat_interface():
                 return
             print("✅ Query embedding created")
             
-            # Search Pinecone
+            # Enhanced Pinecone search with filters based on intent
             print("🔍 Searching Pinecone...")
             try:
+                # Adjust top_k based on context depth
+                top_k = {
+                    "concise": 3,
+                    "standard": 5,
+                    "detailed": 8
+                }[context_depth]
+                
                 results = index.query(
                     vector=query_embedding,
-                    top_k=5,
-                    include_metadata=True
+                    top_k=top_k,
+                    include_metadata=True,
+                    filter=build_search_filter(query_intent)  # New function to create relevant filters
                 )
-                matches = results.matches  # Get the matches from the QueryResponse object
+                matches = results.matches
                 print(f"✅ Found {len(matches)} matching documents")
                 
-                # Debug: Print raw results in a safe way
+                # Debug: Print raw results
                 print("\n🔍 Raw Pinecone results:")
                 for match in matches:
                     print(f"Score: {match.score}")
@@ -1393,46 +1434,49 @@ def chat_interface():
                 st.warning("No relevant documents found for your query. Please try a different question.")
                 return
             
-            # Format context from search results
+            # Format enhanced context from search results
             context = []
             for match in matches:
                 metadata = match.metadata
                 score = match.score
                 
-                # Debug: Print each document's metadata
-                print(f"\n📄 Document metadata for match (score: {score:.2f}):")
-                print(f"Metadata: {metadata}")
-                
-                context.append(f"""
-                Document (Relevance: {score:.2f})
-                Type: {metadata.get('type', 'Unknown')}
-                Date: {metadata.get('uploaded_date', 'Unknown')}
-                Amount: ${metadata.get('total', 'N/A')}
-                Content: {metadata.get('text', 'No text available')}
-                ---
-                """)
-                
-            # Generate response using OpenAI
+                # Create rich context based on document type and content
+                context_entry = format_document_context(
+                    metadata,
+                    score,
+                    context_depth,
+                    query_intent
+                )
+                context.append(context_entry)
+            
+            # Generate response using OpenAI with enhanced context
             with st.chat_message("assistant"):
                 try:
                     print("\n🤖 Generating AI response...")
                     messages = [
-                        {"role": "system", "content": "You are a helpful assistant that answers questions about documents. Use the provided document context to answer questions accurately. If you're not sure about something, say so."},
+                        {"role": "system", "content": create_system_prompt(context_depth, query_intent)},
                         {"role": "user", "content": f"""Context from relevant documents:
                         
                         {' '.join(context)}
+                        
+                        Query Intent:
+                        {json.dumps(query_intent, indent=2)}
                         
                         Question: {prompt}"""}
                     ]
                     
                     response = client.chat.completions.create(
-                        model="gpt-4",
+                        model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
                         messages=messages,
                         temperature=0.7,
                     )
                     
                     assistant_response = response.choices[0].message.content
                     print("✅ AI response generated")
+                    
+                    # Add citations and metadata if using detailed context
+                    if context_depth == "detailed":
+                        assistant_response += "\n\nSources:\n" + format_citations(matches)
                     
                     st.markdown(assistant_response)
                     st.session_state.chat_messages.append({"role": "assistant", "content": assistant_response})
@@ -1445,6 +1489,113 @@ def chat_interface():
         print(f"❌ Error in chat interface: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         st.error(f"Error in chat interface: {str(e)}")
+
+def build_search_filter(query_intent):
+    """Build Pinecone filter based on query intent"""
+    filter_dict = {}
+    
+    # Add temporal filters if specified
+    if 'temporal_context' in query_intent:
+        # Implementation for temporal filtering
+        pass
+    
+    # Add document type filters if specified
+    if 'required_document_types' in query_intent and query_intent['required_document_types'] != ['all']:
+        filter_dict['type'] = {'$in': query_intent['required_document_types']}
+    
+    # Only return filter_dict if it has filters
+    return filter_dict if filter_dict else None
+
+def format_document_context(metadata, score, depth, query_intent):
+    """Format document context based on depth and relevance"""
+    context_parts = []
+    
+    # Basic document info
+    context_parts.append(f"""
+    Document (Relevance: {score:.2f})
+    Type: {metadata.get('type', 'Unknown')}
+    Date: {metadata.get('temporal_data', {}).get('creation_date', 'Unknown')}
+    """)
+    
+    # Add document structure info
+    structure = metadata.get('document_structure', {})
+    context_parts.append("""
+    Document Structure:
+    - {'Multi-page' if structure.get('multi_page') else 'Single-page'} document
+    - {'Contains' if structure.get('has_handwriting') else 'No'} handwriting
+    - {'Contains' if structure.get('has_drawings') else 'No'} drawings/diagrams
+    - {'Contains' if structure.get('has_tables') else 'No'} tables
+    - {'Contains' if structure.get('has_lists') else 'No'} lists
+    """)
+    
+    # Add content analysis based on depth
+    if depth in ["standard", "detailed"]:
+        content_analysis = metadata.get('content_analysis', {})
+        context_parts.append(f"""
+        Key Concepts: {', '.join(content_analysis.get('key_concepts', []))}
+        Topics: {', '.join(content_analysis.get('topics', []))}
+        """)
+        
+        if depth == "detailed":
+            context_parts.append(f"""
+            Named Entities: {json.dumps(content_analysis.get('named_entities', {}), indent=2)}
+            Action Items: {', '.join(content_analysis.get('action_items', []))}
+            Sentiment: {content_analysis.get('sentiment', 'neutral')}
+            Importance: {content_analysis.get('importance_score', 5)}/10
+            """)
+    
+    # Add document content
+    context_parts.append(f"""
+    Content: {metadata.get('text', 'No text available')}
+    """)
+    
+    # Add relationships if available
+    if depth == "detailed":
+        relationships = metadata.get('relationships', {})
+        if any(relationships.values()):
+            context_parts.append("""
+            Related Documents:
+            - References: {', '.join(relationships.get('references', []))}
+            - Referenced by: {', '.join(relationships.get('referenced_by', []))}
+            - Follows up on: {', '.join(relationships.get('follows_up', []))}
+            """)
+    
+    return "\n".join(context_parts)
+
+def create_system_prompt(depth, query_intent):
+    """Create dynamic system prompt based on context depth and query intent"""
+    base_prompt = """You are an intelligent assistant analyzing a personal document archive. 
+    This archive contains various types of documents including handwritten notes, essays, medical records, 
+    receipts, and other personal papers."""
+    
+    depth_specific = {
+        "concise": "Provide brief, focused answers using only the most relevant information.",
+        "standard": "Balance detail and brevity, highlighting key information and relationships.",
+        "detailed": "Provide comprehensive answers, including supporting details, relationships, and citations."
+    }[depth]
+    
+    intent_specific = f"""
+    Focus areas based on query intent:
+    - Primary topic: {query_intent.get('primary_topic', 'general')}
+    - Temporal context: {query_intent.get('temporal_context', 'any time')}
+    - Document types: {', '.join(query_intent.get('required_document_types', ['all']))}
+    """
+    
+    return f"{base_prompt}\n\n{depth_specific}\n\n{intent_specific}"
+
+def format_citations(matches):
+    """Format document citations for detailed responses"""
+    citations = []
+    for match in matches:
+        metadata = match.metadata
+        citation = f"""
+        - {metadata.get('type', 'Document')} from {metadata.get('temporal_data', {}).get('creation_date', 'unknown date')}
+          ID: {metadata.get('document_id')}
+          Relevance: {match.score:.2f}
+          Topics: {', '.join(metadata.get('content_analysis', {}).get('topics', []))}
+        """
+        citations.append(citation)
+    return "\n".join(citations)
 
 def exchange_code_for_tokens(code):
     """Exchange authorization code for access and refresh tokens"""
@@ -1934,18 +2085,212 @@ def fetch_document_details(account_id, doc_id, access_token):
         return None
 
 def create_document_metadata(doc_data, extracted_text):
-    """Create metadata for document storage"""
-    return {
+    """Create comprehensive metadata for document storage"""
+    # Get document type and enhance it
+    doc_type = doc_data.get('type', 'unknown').lower()
+    
+    # Extract named entities and concepts using GPT
+    try:
+        entity_response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Analyze the following text and extract: 1) Named entities (people, places, organizations), 2) Key concepts/themes, 3) Action items/tasks, 4) Important dates, and 5) Related concepts. Format as JSON."
+            }, {
+                "role": "user",
+                "content": extracted_text[:4000]  # First 4000 chars for entity analysis
+            }],
+            temperature=0.2
+        )
+        entities_and_concepts = json.loads(entity_response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error extracting entities: {str(e)}")
+        entities_and_concepts = {}
+
+    # Analyze document sentiment and importance
+    try:
+        analysis_response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Analyze the text and provide: 1) Overall sentiment (positive/negative/neutral), 2) Document importance (1-10), 3) Document category/topics. Format as JSON."
+            }, {
+                "role": "user",
+                "content": extracted_text[:4000]
+            }],
+            temperature=0.2
+        )
+        document_analysis = json.loads(analysis_response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error analyzing document: {str(e)}")
+        document_analysis = {}
+
+    # Base metadata with enhanced structure
+    metadata = {
+        # Basic document information
         'document_id': doc_data.get('id'),
-        'type': doc_data.get('type', 'unknown'),
-        'vendor': doc_data.get('vendor') or 'unknown',
-        'total': float(doc_data.get('total', 0) or 0),
+        'type': doc_type,
         'uploaded_date': doc_data.get('uploaded', '') or '',
+        'modified_date': doc_data.get('modified', '') or '',
         'categories': doc_data.get('categories', []) or [],
         'text': (extracted_text[:4000] if extracted_text else '') or '',
         'processing_state': doc_data.get('processingState', 'unknown'),
-        'modified_date': doc_data.get('modified', '') or ''
+        
+        # Document characteristics
+        'document_structure': {
+            'multi_page': '\nPage ' in extracted_text,
+            'has_tables': 'table' in extracted_text.lower(),
+            'has_lists': any(marker in extracted_text for marker in ['•', '-', '1.', '2.', '3.']),
+            'has_handwriting': any(term in extracted_text.lower() for term in ['handwritten', 'handwriting', 'written by hand']),
+            'has_drawings': any(term in extracted_text.lower() for term in ['drawing', 'diagram', 'sketch', 'illustration']),
+            'has_signatures': any(term in extracted_text.lower() for term in ['signed', 'signature']),
+            'has_forms': any(term in extracted_text.lower() for term in ['form', 'checkbox', 'field', 'fill out']),
+        },
+        
+        # Enhanced content understanding
+        'content_analysis': {
+            'named_entities': entities_and_concepts.get('named_entities', {}),
+            'key_concepts': entities_and_concepts.get('key_concepts', []),
+            'action_items': entities_and_concepts.get('action_items', []),
+            'related_concepts': entities_and_concepts.get('related_concepts', []),
+            'sentiment': document_analysis.get('sentiment', 'neutral'),
+            'importance_score': document_analysis.get('importance', 5),
+            'topics': document_analysis.get('topics', []),
+        },
+        
+        # Temporal information
+        'temporal_data': {
+            'creation_date': doc_data.get('created', ''),
+            'dates_mentioned': extract_dates(extracted_text),
+            'time_references': extract_time_references(extracted_text),
+        },
+        
+        # Source information
+        'source_metadata': {
+            'origin_system': 'shoeboxed',
+            'original_filename': doc_data.get('attachment', {}).get('filename', ''),
+            'file_type': doc_data.get('attachment', {}).get('type', 'unknown'),
+            'confidence_score': calculate_confidence_score(extracted_text),
+        },
+        
+        # Relationship tracking
+        'relationships': {
+            'related_documents': [],  # To be populated by relationship analysis
+            'references': [],         # Documents this one references
+            'referenced_by': [],      # Documents that reference this one
+            'follows_up': [],         # Documents this one follows up on
+            'followed_by': [],        # Documents that follow up on this one
+        }
     }
+    
+    # Add type-specific metadata
+    if doc_type == 'receipt':
+        metadata.update({
+            'financial_data': {
+                'vendor': doc_data.get('vendor') or 'unknown',
+                'total': float(doc_data.get('total', 0) or 0),
+                'currency': doc_data.get('currency', 'USD'),
+                'payment_method': extract_payment_method(extracted_text),
+                'items': extract_line_items(extracted_text),
+            }
+        })
+    elif doc_type == 'document':
+        metadata.update({
+            'document_specific': {
+                'author': extract_author(extracted_text),
+                'recipients': extract_recipients(extracted_text),
+                'subject': extract_subject(extracted_text),
+            }
+        })
+    
+    return metadata
+
+def extract_dates(text):
+    """Extract dates from text using comprehensive patterns"""
+    date_patterns = [
+        r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',  # MM/DD/YYYY, DD/MM/YYYY
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b',  # Month DD, YYYY
+        r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b',  # YYYY-MM-DD
+        r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2},? \d{4}\b',  # Full month
+        r'\b\d{1,2}(?:st|nd|rd|th) (?:of )?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}\b'  # 1st of January 2024
+    ]
+    dates = []
+    for pattern in date_patterns:
+        dates.extend(re.findall(pattern, text, re.IGNORECASE))
+    return list(set(dates))
+
+def extract_time_references(text):
+    """Extract temporal references from text"""
+    time_patterns = [
+        r'\b(?:today|tomorrow|yesterday)\b',
+        r'\b(?:next|last) (?:week|month|year)\b',
+        r'\b(?:in|after|before) \d+ (?:days?|weeks?|months?|years?)\b',
+        r'\b(?:morning|afternoon|evening|night)\b',
+        r'\b\d{1,2}:\d{2} ?(?:AM|PM|am|pm)?\b'
+    ]
+    references = []
+    for pattern in time_patterns:
+        references.extend(re.findall(pattern, text, re.IGNORECASE))
+    return list(set(references))
+
+def calculate_confidence_score(text):
+    """Calculate confidence score based on text quality"""
+    score = 1.0
+    if len(text.strip()) < 100:
+        score *= 0.8
+    if text.count('\n') < 2:
+        score *= 0.9
+    if any(marker in text.lower() for marker in ['unclear', 'illegible', 'unreadable']):
+        score *= 0.7
+    return round(score, 2)
+
+def extract_payment_method(text):
+    """Extract payment method from text"""
+    payment_methods = {
+        'credit': ['credit card', 'visa', 'mastercard', 'amex', 'discover'],
+        'debit': ['debit card', 'debit'],
+        'cash': ['cash', 'paid in cash'],
+        'check': ['check', 'cheque', 'check #'],
+        'digital': ['paypal', 'venmo', 'zelle', 'apple pay', 'google pay']
+    }
+    text_lower = text.lower()
+    for method, keywords in payment_methods.items():
+        if any(keyword in text_lower for keyword in keywords):
+            return method
+    return 'unknown'
+
+def extract_line_items(text):
+    """Extract line items from receipt text"""
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Extract line items from this receipt text. Format as a list of JSON objects with 'item', 'quantity', and 'price' fields."
+            }, {
+                "role": "user",
+                "content": text
+            }],
+            temperature=0.2
+        )
+        return json.loads(response.choices[0].message.content)
+    except:
+        return []
+
+def extract_author(text):
+    """Extract author information from document"""
+    # Implementation would use GPT to identify author
+    return None
+
+def extract_recipients(text):
+    """Extract recipient information from document"""
+    # Implementation would use GPT to identify recipients
+    return []
+
+def extract_subject(text):
+    """Extract subject/title from document"""
+    # Implementation would use GPT to identify subject
+    return None
 
 def store_in_pinecone(index, doc_id, extracted_text, metadata):
     """Store document in Pinecone"""
