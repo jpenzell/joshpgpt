@@ -1330,12 +1330,18 @@ def process_documents():
 
 def chat_interface():
     """Chat interface for interacting with processed documents"""
+    # Initialize chat messages if not exists
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+        
     try:
-        # Initialize Pinecone
+        # Initialize Pinecone with logging
+        print("\n🔍 Initializing Pinecone connection...")
         index = init_pinecone()
         if not index:
-            st.error("Failed to initialize Pinecone")
+            st.error("Failed to initialize Pinecone. Please check your Pinecone configuration.")
             return
+        print("✅ Pinecone connection established")
         
         # Display chat messages
         for message in st.session_state.chat_messages:
@@ -1344,64 +1350,101 @@ def chat_interface():
         
         # Chat input
         if prompt := st.chat_input("Ask about your documents"):
+            print(f"\n📝 Received query: {prompt}")
+            
             # Add user message to chat history
             st.session_state.chat_messages.append({"role": "user", "content": prompt})
-            
             with st.chat_message("user"):
                 st.markdown(prompt)
             
             # Create embedding for the query
+            print("🔄 Creating query embedding...")
             query_embedding = create_embedding(prompt)
             if not query_embedding:
-                st.error("Failed to create query embedding")
+                st.error("Failed to create query embedding. Please try again.")
+                return
+            print("✅ Query embedding created")
+            
+            # Search Pinecone
+            print("🔍 Searching Pinecone...")
+            try:
+                results = index.query(
+                    vector=query_embedding,
+                    top_k=5,
+                    include_metadata=True
+                )
+                matches = results.matches  # Get the matches from the QueryResponse object
+                print(f"✅ Found {len(matches)} matching documents")
+                
+                # Debug: Print raw results in a safe way
+                print("\n🔍 Raw Pinecone results:")
+                for match in matches:
+                    print(f"Score: {match.score}")
+                    print(f"Metadata: {match.metadata}")
+                    print("---")
+                
+            except Exception as e:
+                print(f"❌ Pinecone query error: {str(e)}")
+                st.error(f"Error searching documents: {str(e)}")
                 return
             
-            # Search Pinecone with improved parameters
-            results = index.query(
-                vector=query_embedding,
-                top_k=5,
-                include_metadata=True,
-                namespace=os.getenv('PINECONE_INDEX_NAME')
-            )
+            if not matches:
+                print("⚠️ No matching documents found")
+                st.warning("No relevant documents found for your query. Please try a different question.")
+                return
             
             # Format context from search results
             context = []
-            for match in results['matches']:
-                metadata = match['metadata']
-                score = match['score']
+            for match in matches:
+                metadata = match.metadata
+                score = match.score
+                
+                # Debug: Print each document's metadata
+                print(f"\n📄 Document metadata for match (score: {score:.2f}):")
+                print(f"Metadata: {metadata}")
+                
                 context.append(f"""
                 Document (Relevance: {score:.2f})
-                Category: {metadata.get('category', 'Unknown')}
-                Date: {metadata.get('created', 'Unknown')}
+                Type: {metadata.get('type', 'Unknown')}
+                Date: {metadata.get('uploaded_date', 'Unknown')}
                 Amount: ${metadata.get('total', 'N/A')}
                 Content: {metadata.get('text', 'No text available')}
                 ---
                 """)
-            
-            # Generate response using GPT-4
-            system_message = """You are an AI assistant analyzing financial documents. 
-            Use the provided document excerpts to answer questions accurately and concisely.
-            Include specific dates, amounts, and categories when relevant.
-            If information is unclear or missing, say so."""
-            
-            messages = [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": f"Based on these documents:\n\n{''.join(context)}\n\nQuestion: {prompt}"}
-            ]
-            
-            with st.chat_message("assistant"):
-                response = client.chat.completions.create(
-                    model=os.getenv('OPENAI_CHAT_MODEL'),
-                    messages=messages,
-                    temperature=0.7
-                )
-                answer = response.choices[0].message.content
-                st.markdown(answer)
-                st.session_state.chat_messages.append({"role": "assistant", "content": answer})
                 
+            # Generate response using OpenAI
+            with st.chat_message("assistant"):
+                try:
+                    print("\n🤖 Generating AI response...")
+                    messages = [
+                        {"role": "system", "content": "You are a helpful assistant that answers questions about documents. Use the provided document context to answer questions accurately. If you're not sure about something, say so."},
+                        {"role": "user", "content": f"""Context from relevant documents:
+                        
+                        {' '.join(context)}
+                        
+                        Question: {prompt}"""}
+                    ]
+                    
+                    response = client.chat.completions.create(
+                        model="gpt-4",
+                        messages=messages,
+                        temperature=0.7,
+                    )
+                    
+                    assistant_response = response.choices[0].message.content
+                    print("✅ AI response generated")
+                    
+                    st.markdown(assistant_response)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": assistant_response})
+                    
+                except Exception as e:
+                    print(f"❌ Error generating response: {str(e)}")
+                    st.error(f"Error generating response: {str(e)}")
+                    
     except Exception as e:
-        st.error(f"Error in chat interface: {str(e)}")
+        print(f"❌ Error in chat interface: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
+        st.error(f"Error in chat interface: {str(e)}")
 
 def exchange_code_for_tokens(code):
     """Exchange authorization code for access and refresh tokens"""
@@ -1552,16 +1595,24 @@ def reset_processing_state():
 
 def main():
     """Main application function"""
-    st.title("Shoeboxed Document Processor")
+    # Initialize session state for interface mode
+    if 'current_interface' not in st.session_state:
+        st.session_state.current_interface = 'processor'
     
-    # Initialize session state
-    init_session_state()
+    # Initialize other session states
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'processing_active' not in st.session_state:
+        st.session_state.processing_active = False
+    if 'paused' not in st.session_state:
+        st.session_state.paused = False
     
     # Sidebar
     st.sidebar.title("Controls")
     
     # Main authentication flow
     if not st.session_state.authenticated:
+        st.title("Shoeboxed Document Processor")
         st.info("Please authenticate with Shoeboxed to begin.")
         if st.button("🔑 Authenticate with Shoeboxed"):
             handle_auth()
@@ -1571,20 +1622,12 @@ def main():
         # Load checkpoint data immediately after login
         checkpoint = ProcessingCheckpoint()
         
-        # Initialize processing state if not exists
-        if 'processing_active' not in st.session_state:
-            st.session_state.processing_active = False
-        if 'paused' not in st.session_state:
-            st.session_state.paused = False
-        
         # Add processing controls with pause/resume
         col1, col2, col3 = st.sidebar.columns(3)
         
-        # Check if processing is active
-        processing_active = hasattr(st.session_state, 'processor')
-        
         # Process button
-        if col1.button("📄 Process", disabled=False):  # Never disable Process button
+        if col1.button("📄 Process"):
+            st.session_state.current_interface = 'processor'
             # Clean up any existing processor
             if hasattr(st.session_state, 'processor'):
                 delattr(st.session_state, 'processor')
@@ -1595,35 +1638,30 @@ def main():
             process_documents()
         
         # Pause/Resume button
-        if processing_active:
-            pause_button_label = "⏸️ Pause" if not st.session_state.get('paused', False) else "▶️ Resume"
-            if col2.button(pause_button_label, key="pause_resume_button"):
-                try:
-                    st.session_state.paused = not st.session_state.get('paused', False)
-                    if st.session_state.paused:
-                        st.sidebar.warning("Processing paused")
-                    else:
-                        st.sidebar.success("Processing resumed")
-                    time.sleep(0.1)  # Small delay to ensure state updates
-                    st.rerun()  # Updated from experimental_rerun()
-                except Exception as e:
-                    st.error(f"Error toggling pause state: {str(e)}")
-                    print(f"Error in pause/resume: {str(e)}")
-                    print(traceback.format_exc())
-        else:
-            # Show disabled pause button when not processing
-            col2.button("⏸️ Pause", disabled=True, key="pause_button_disabled")
+        pause_button_label = "⏸️ Pause" if not st.session_state.get('paused', False) else "▶️ Resume"
+        if col2.button(pause_button_label):
+            st.session_state.paused = not st.session_state.get('paused', False)
+            if st.session_state.paused:
+                st.sidebar.warning("Processing paused")
+            else:
+                st.sidebar.success("Processing resumed")
+                # When resuming, ensure processor is active
+                if not hasattr(st.session_state, 'processor'):
+                    st.session_state.processor = DocumentProcessor()
+                    st.session_state.processor.checkpoint = checkpoint
+                    process_documents()
+            st.rerun()
         
-        # Reset button
-        if col3.button("🔄 Reset", disabled=processing_active and not st.session_state.get('paused', False)):
+        # Reset button - enabled when processing is paused or not active
+        if col3.button("🔄 Reset"):
             try:
                 if hasattr(st.session_state, 'processor'):
                     st.session_state.processor.stop_event.set()
                     delattr(st.session_state, 'processor')
                 st.session_state.paused = False
                 st.session_state.processing_active = False
-                time.sleep(0.1)  # Small delay to ensure state updates
-                st.rerun()  # Updated from experimental_rerun()
+                st.session_state.current_interface = 'processor'
+                st.rerun()
             except Exception as e:
                 st.error(f"Error resetting processor: {str(e)}")
                 print(f"Error in reset: {str(e)}")
@@ -1636,8 +1674,9 @@ def main():
             key="chat_button"
         )
         
-        if chat_button and not st.session_state.processing_active:
-            chat_interface()
+        if chat_button:
+            st.session_state.current_interface = 'chat'
+            st.rerun()
         
         # Logout button - enabled only when not processing
         logout_button = st.sidebar.button(
@@ -1653,25 +1692,31 @@ def main():
             st.session_state.clear()
             st.rerun()
         
-        # Display processing statistics in the main area
-        col1, col2, col3 = st.columns(3)
-        col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
-        col2.metric("❌ Failed Documents", len(checkpoint.failed_docs))
-        col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_docs))
-        
-        # Show failed document details in an expander if there are any
-        if checkpoint.failed_docs:
-            with st.expander("Failed Documents Details"):
-                for doc_id in checkpoint.failed_docs:
-                    reason = checkpoint.failure_reasons.get(doc_id, "Unknown reason")
-                    retries = checkpoint.retry_counts.get(doc_id, 0)
-                    st.text(f"Document {doc_id}:")
-                    st.text(f"  Reason: {reason}")
-                    st.text(f"  Retry attempts: {retries}")
-        
-        # Show processing status if available
-        if hasattr(st.session_state, 'processing_status'):
-            st.write(st.session_state.processing_status)
+        # Display appropriate interface based on current_interface
+        if st.session_state.current_interface == 'chat':
+            st.title("Chat with Your Documents")
+            chat_interface()
+        else:
+            st.title("Shoeboxed Document Processor")
+            # Display processing statistics in the main area
+            col1, col2, col3 = st.columns(3)
+            col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
+            col2.metric("❌ Failed Documents", len(checkpoint.failed_docs))
+            col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_docs))
+            
+            # Show failed document details in an expander if there are any
+            if checkpoint.failed_docs:
+                with st.expander("Failed Documents Details"):
+                    for doc_id in checkpoint.failed_docs:
+                        reason = checkpoint.failure_reasons.get(doc_id, "Unknown reason")
+                        retries = checkpoint.retry_counts.get(doc_id, 0)
+                        st.text(f"Document {doc_id}:")
+                        st.text(f"  Reason: {reason}")
+                        st.text(f"  Retry attempts: {retries}")
+            
+            # Show processing status if available
+            if hasattr(st.session_state, 'processing_status'):
+                st.write(st.session_state.processing_status)
 
 # Add cleanup on app exit
 def on_shutdown():
@@ -1973,11 +2018,8 @@ class DocumentProcessor:
         """Worker thread for processing documents"""
         while not self.stop_event.is_set():
             try:
-                # Check for pause state with proper thread safety
-                with self.lock:
-                    is_paused = st.session_state.get('paused', False)
-                
-                if is_paused:
+                # Check for pause state
+                if st.session_state.get('paused', False):
                     time.sleep(0.5)  # Short sleep to prevent CPU spinning
                     continue
                 
@@ -2036,9 +2078,10 @@ class DocumentProcessor:
     def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
         """Process a batch of documents with real-time progress updates"""
         try:
-            # Initialize processing queue
-            for doc in documents:
-                self.processing_queue.put(doc)
+            # Initialize processing queue if empty
+            if self.processing_queue.empty():
+                for doc in documents:
+                    self.processing_queue.put(doc)
             
             # Create and start worker threads
             num_threads = min(MAX_THREADS, len(documents))
@@ -2054,8 +2097,7 @@ class DocumentProcessor:
                         self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
                         
                         # Update status message based on pause state
-                        with self.lock:
-                            is_paused = st.session_state.get('paused', False)
+                        is_paused = st.session_state.get('paused', False)
                         
                         if is_paused:
                             status_text.text("⏸️ Processing paused... Click Resume to continue")
