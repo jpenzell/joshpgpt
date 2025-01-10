@@ -1372,13 +1372,11 @@ def process_documents():
 
 def chat_interface():
     """Enhanced chat interface for second brain interaction"""
-    # Initialize chat messages if not exists
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-    if "context_depth" not in st.session_state:
-        st.session_state.context_depth = "standard"  # or "detailed" or "concise"
-        
     try:
+        # Initialize chat messages if not exists
+        if "chat_messages" not in st.session_state:
+            st.session_state.chat_messages = []
+        
         # Initialize Pinecone
         print("\n🔍 Initializing Pinecone connection...")
         index = init_pinecone()
@@ -1386,16 +1384,6 @@ def chat_interface():
             st.error("Failed to initialize Pinecone. Please check your configuration.")
             return
         print("✅ Pinecone connection established")
-        
-        # Add context depth selector in sidebar
-        st.sidebar.write("### Chat Settings")
-        context_depth = st.sidebar.select_slider(
-            "Context Depth",
-            options=["concise", "standard", "detailed"],
-            value=st.session_state.context_depth,
-            help="Controls how much context is included in responses"
-        )
-        st.session_state.context_depth = context_depth
         
         # Display chat messages
         for message in st.session_state.chat_messages:
@@ -1411,26 +1399,6 @@ def chat_interface():
             with st.chat_message("user"):
                 st.markdown(prompt)
             
-            # Analyze query intent
-            print("🧠 Analyzing query intent...")
-            try:
-                intent_response = client.chat.completions.create(
-                    model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
-                    messages=[{
-                        "role": "system",
-                        "content": "Analyze the query to determine: 1) Primary topic/intent, 2) Temporal context (if any), 3) Required document types, 4) Key entities to look for. Format as JSON."
-                    }, {
-                        "role": "user",
-                        "content": prompt
-                    }],
-                    temperature=0.2
-                )
-                query_intent = json.loads(intent_response.choices[0].message.content)
-                print(f"✅ Query intent analyzed: {query_intent}")
-            except Exception as e:
-                print(f"⚠️ Error analyzing intent: {str(e)}")
-                query_intent = {}
-            
             # Create embedding for the query
             print("🔄 Creating query embedding...")
             query_embedding = create_embedding(prompt)
@@ -1439,24 +1407,16 @@ def chat_interface():
                 return
             print("✅ Query embedding created")
             
-            # Enhanced Pinecone search with filters based on intent
+            # Search Pinecone
             print("🔍 Searching Pinecone...")
             try:
-                # Adjust top_k based on context depth
-                top_k = {
-                    "concise": 3,
-                    "standard": 5,
-                    "detailed": 8
-                }[context_depth]
-                
                 results = index.query(
                     vector=query_embedding,
-                    top_k=top_k,
-                    include_metadata=True,
-                    filter=build_search_filter(query_intent)  # New function to create relevant filters
+                    top_k=5,
+                    include_metadata=True
                 )
                 matches = results.matches
-                print(f"✅ Found {len(matches)} matching documents")
+                print(f"✅ Found {len(matches)} matching chunks")
                 
                 # Debug: Print raw results
                 print("\n🔍 Raw Pinecone results:")
@@ -1475,61 +1435,366 @@ def chat_interface():
                 st.warning("No relevant documents found for your query. Please try a different question.")
                 return
             
-            # Format enhanced context from search results
+            # Build context from matches
             context = []
             for match in matches:
                 metadata = match.metadata
                 score = match.score
                 
-                # Create rich context based on document type and content
-                context_entry = format_document_context(
-                    metadata,
-                    score,
-                    context_depth,
-                    query_intent
-                )
-                context.append(context_entry)
+                # Format document context
+                doc_context = f"""
+                Document (Relevance: {score:.2f}):
+                Type: {metadata.get('type', 'Unknown')}
+                Created: {metadata.get('created', 'Unknown')}
+                Content: {metadata.get('text', 'No text available')}
+                """
+                context.append(doc_context)
             
-            # Generate response using OpenAI with enhanced context
-            with st.chat_message("assistant"):
-                try:
-                    print("\n🤖 Generating AI response...")
-                    messages = [
-                        {"role": "system", "content": create_system_prompt(context_depth, query_intent)},
-                        {"role": "user", "content": f"""Context from relevant documents:
-                        
-                        {' '.join(context)}
-                        
-                        Query Intent:
-                        {json.dumps(query_intent, indent=2)}
-                        
-                        Question: {prompt}"""}
-                    ]
+            # Combine all context
+            full_context = "\n\n".join(context)
+            
+            # Generate AI response
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"""You are an intelligent AI assistant acting as a second brain for the user. 
+                    You have access to their document repository and should help them find and understand their information.
                     
-                    response = client.chat.completions.create(
-                        model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
-                        messages=messages,
-                        temperature=0.7,
-                    )
-                    
-                    assistant_response = response.choices[0].message.content
-                    print("✅ AI response generated")
-                    
-                    # Add citations and metadata if using detailed context
-                    if context_depth == "detailed":
-                        assistant_response += "\n\nSources:\n" + format_citations(matches)
-                    
-                    st.markdown(assistant_response)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": assistant_response})
-                    
-                except Exception as e:
-                    print(f"❌ Error generating response: {str(e)}")
-                    st.error(f"Error generating response: {str(e)}")
-                    
+                    Current context from documents:
+                    {full_context}"""
+                }
+            ]
+            
+            # Add chat history for context
+            for message in st.session_state.chat_messages[-3:]:  # Last 3 messages
+                messages.append({
+                    "role": message["role"],
+                    "content": message["content"]
+                })
+            
+            try:
+                response = client.chat.completions.create(
+                    model=os.getenv('OPENAI_MODEL', 'gpt-4'),
+                    messages=messages,
+                    temperature=0.7
+                )
+                
+                ai_response = response.choices[0].message.content
+                print(f"✅ Generated AI response: {ai_response[:100]}...")
+                
+                # Update chat history
+                st.session_state.chat_messages.append({"role": "assistant", "content": ai_response})
+                
+                # Display AI response
+                with st.chat_message("assistant"):
+                    st.markdown(ai_response)
+                
+            except Exception as e:
+                print(f"⚠️ Error generating response: {str(e)}")
+                st.error("I apologize, but I encountered an error while generating a response. Please try again.")
+    
     except Exception as e:
         print(f"❌ Error in chat interface: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         st.error(f"Error in chat interface: {str(e)}")
+
+def format_precise_context(context, depth):
+    """Format context for precise mode"""
+    formatted_chunks = []
+    
+    # Sort chunks by score
+    sorted_chunks = sorted(context['chunks'], key=lambda x: x['score'], reverse=True)
+    
+    for chunk in sorted_chunks:
+        chunk_text = chunk['text']
+        metadata = chunk['metadata']
+        
+        # Format based on depth
+        if depth == "concise":
+            formatted_chunks.append(f"Document content: {chunk_text}")
+        else:
+            formatted_chunks.append(f"""
+            Document Type: {metadata.get('type', 'Unknown')}
+            Creation Date: {metadata.get('temporal_data', {}).get('creation_date', 'Unknown')}
+            Content: {chunk_text}
+            Topics: {', '.join(metadata.get('content_analysis', {}).get('topics', []))}
+            """)
+    
+    return "\n\n".join(formatted_chunks)
+
+def format_exploratory_context(context, depth, intent):
+    """Format context for exploratory mode"""
+    sections = []
+    
+    # Add direct content
+    content_section = format_precise_context(context, depth)
+    sections.append("Direct Content:\n" + content_section)
+    
+    # Add relationship insights
+    if context['relationship_chains']:
+        relationship_section = "Related Document Chains:\n"
+        for chain in context['relationship_chains']:
+            relationship_section += f"""
+            Chain starting from {chain['start_doc']}:
+            - Connected to: {', '.join(chain['chain'])}
+            - Through: {', '.join(chain['relationship_types'])}
+            - Overall connection strength: {chain['total_strength']:.2f}
+            """
+        sections.append(relationship_section)
+    
+    # Add temporal insights
+    if context['temporal_context']:
+        temporal_section = "Temporal Context:\n"
+        sorted_temporal = sorted(context['temporal_context'], key=lambda x: x['date'] if x['date'] else "")
+        for temp_context in sorted_temporal:
+            temporal_section += f"""
+            Date: {temp_context['date']}
+            Document: {temp_context['document_id']}
+            Time References: {', '.join(temp_context['temporal_references'])}
+            """
+        sections.append(temporal_section)
+    
+    # Add knowledge graph insights
+    if context['knowledge_graph']['nodes']:
+        graph_section = "Knowledge Graph Insights:\n"
+        for node in context['knowledge_graph']['nodes']:
+            graph_section += f"""
+            Topic: {node['node_type']}
+            Key Concepts: {', '.join(node['concepts'])}
+            Importance: {node['importance']}/10
+            """
+        sections.append(graph_section)
+    
+    return "\n\n".join(sections)
+
+def format_smart_context(context, depth):
+    """Format context for smart mode (balanced approach)"""
+    sections = []
+    
+    # Add most relevant direct content
+    top_chunks = sorted(context['chunks'], key=lambda x: x['score'], reverse=True)[:3]
+    content_section = "Most Relevant Content:\n"
+    for chunk in top_chunks:
+        content_section += f"""
+        {chunk['text']}
+        (Relevance: {chunk['score']:.2f})
+        """
+    sections.append(content_section)
+    
+    # Add key relationships if available
+    if context['knowledge_graph']['edges']:
+        relationships_section = "Key Relationships:\n"
+        strong_connections = [
+            edge for edge in context['knowledge_graph']['edges']
+            if edge['strength'] > 0.8
+        ][:3]
+        for connection in strong_connections:
+            relationships_section += f"""
+            {connection['source']} → {connection['target']}
+            Type: {connection['type']}
+            """
+        sections.append(relationships_section)
+    
+    # Add temporal context if relevant
+    if context['temporal_context']:
+        temporal_section = "Temporal Context:\n"
+        recent_contexts = sorted(
+            context['temporal_context'],
+            key=lambda x: x['date'] if x['date'] else "",
+            reverse=True
+        )[:2]
+        for temp_context in recent_contexts:
+            temporal_section += f"""
+            Date: {temp_context['date']}
+            References: {', '.join(temp_context['temporal_references'][:3])}
+            """
+        sections.append(temporal_section)
+    
+    return "\n\n".join(sections)
+
+def add_precise_citations(response, context):
+    """Add precise citations to response"""
+    citations = []
+    for chunk in context['chunks']:
+        metadata = chunk['metadata']
+        citations.append(f"""
+        Source: {metadata.get('type', 'Document')} {metadata.get('document_id')}
+        Date: {metadata.get('temporal_data', {}).get('creation_date', 'unknown')}
+        Relevance: {chunk['score']:.2f}
+        """)
+    return f"{response}\n\nSources:\n{''.join(citations)}"
+
+def add_exploratory_citations(response, context):
+    """Add exploratory citations with relationship context"""
+    citations = []
+    
+    # Document citations
+    citations.append("Direct Sources:")
+    for chunk in context['chunks']:
+        metadata = chunk['metadata']
+        citations.append(f"""
+        {metadata.get('type', 'Document')} {metadata.get('document_id')}
+        - Topics: {', '.join(metadata.get('content_analysis', {}).get('topics', []))}
+        - Key Concepts: {', '.join(metadata.get('content_analysis', {}).get('key_concepts', []))}
+        """)
+    
+    # Relationship citations
+    if context['relationship_chains']:
+        citations.append("\nRelated Document Chains:")
+        for chain in context['relationship_chains']:
+            citations.append(f"""
+            Chain from {chain['start_doc']}
+            - Connected documents: {' → '.join(chain['chain'])}
+            - Connection types: {', '.join(chain['relationship_types'])}
+            """)
+    
+    return f"{response}\n\nReference Context:\n{''.join(citations)}"
+
+def add_smart_citations(response, context):
+    """Add balanced citations with key information"""
+    citations = []
+    
+    # Add most relevant sources
+    top_chunks = sorted(context['chunks'], key=lambda x: x['score'], reverse=True)[:3]
+    citations.append("Key Sources:")
+    for chunk in top_chunks:
+        metadata = chunk['metadata']
+        citations.append(f"""
+        {metadata.get('type', 'Document')} {metadata.get('document_id')}
+        - Date: {metadata.get('temporal_data', {}).get('creation_date', 'unknown')}
+        - Topics: {', '.join(metadata.get('content_analysis', {}).get('topics', []))[:2]}
+        """)
+    
+    # Add key relationships if highly relevant
+    strong_connections = [
+        edge for edge in context['knowledge_graph']['edges']
+        if edge['strength'] > 0.8
+    ][:2]
+    if strong_connections:
+        citations.append("\nRelated Documents:")
+        for connection in strong_connections:
+            citations.append(f"""
+            {connection['source']} → {connection['target']}
+            - Relationship: {connection['type']}
+            """)
+    
+    return f"{response}\n\nSources and Connections:\n{''.join(citations)}"
+
+def get_search_parameters(mode, depth, intent):
+    """Get mode-specific search parameters"""
+    params = {
+        'include_metadata': True,
+        'top_k': {
+            'concise': 3,
+            'standard': 5,
+            'detailed': 8
+        }[depth]
+    }
+    
+    # Add mode-specific adjustments
+    if mode == "precise":
+        params['top_k'] = min(params['top_k'], 5)  # Limit results for precision
+        params['score_threshold'] = 0.8  # Higher similarity threshold
+    elif mode == "exploratory":
+        params['top_k'] = params['top_k'] * 2  # Double results for exploration
+        params['score_threshold'] = 0.6  # Lower threshold to include more connections
+    
+    # Add intent-based filters
+    filter_dict = build_search_filter(intent)
+    if filter_dict:
+        params['filter'] = filter_dict
+    
+    return params
+
+def build_enhanced_context(query_intent, matched_chunks, chat_history):
+    """Build enhanced context using query intent, matched chunks, and chat history."""
+    context_parts = []
+    
+    # Add temporal context if available
+    if query_intent.get("temporal_context", {}).get("period"):
+        context_parts.append(f"Time period of interest: {query_intent['temporal_context']['period']}")
+    
+    # Group chunks by document type
+    chunks_by_type = {}
+    for chunk in matched_chunks:
+        doc_type = chunk.get("metadata", {}).get("document_type", "unknown")
+        if doc_type not in chunks_by_type:
+            chunks_by_type[doc_type] = []
+        chunks_by_type[doc_type].append(chunk)
+    
+    # Add document type summaries
+    for doc_type, chunks in chunks_by_type.items():
+        if chunks:
+            context_parts.append(f"\nRelevant {doc_type} documents:")
+            for chunk in chunks:
+                metadata = chunk.get("metadata", {})
+                date = metadata.get("date", "unknown date")
+                source = metadata.get("source", "unknown source")
+                context_parts.append(f"- {chunk['text']} (from {source}, {date})")
+    
+    # Add relationship context if available
+    if query_intent.get("relationship_types"):
+        context_parts.append("\nRelated information:")
+        for rel_type in query_intent["relationship_types"]:
+            # Here we would traverse the knowledge graph based on relationship type
+            # For now, we'll just note the relationship type
+            context_parts.append(f"- Looking for {rel_type} relationships")
+    
+    # Add recent chat context if relevant
+    if chat_history:
+        recent_context = chat_history[-3:]  # Last 3 messages
+        context_parts.append("\nRecent conversation context:")
+        for msg in recent_context:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            context_parts.append(f"- {role}: {content}")
+    
+    return "\n".join(context_parts)
+
+def create_enhanced_system_prompt(depth, mode, intent):
+    """Create mode-specific system prompt"""
+    base_prompt = """You are an intelligent assistant analyzing a personal document archive. 
+    This archive contains various types of documents including handwritten notes, essays, medical records, 
+    receipts, and other personal papers."""
+    
+    mode_specific = {
+        "precise": "Focus on providing accurate, factual information directly from the documents.",
+        "exploratory": "Explore connections between documents and suggest related topics or insights.",
+        "smart": "Balance accuracy with insightful connections, providing relevant context and relationships."
+    }[mode]
+    
+    depth_specific = {
+        "concise": "Provide brief, focused answers using only the most relevant information.",
+        "standard": "Balance detail and brevity, highlighting key information and relationships.",
+        "detailed": "Provide comprehensive answers, including supporting details, relationships, and citations."
+    }[depth]
+    
+    knowledge_graph_prompt = """
+    Use the knowledge graph to:
+    1) Identify key concept clusters
+    2) Follow relationship chains
+    3) Consider temporal evolution of topics
+    4) Highlight important cross-document insights
+    """
+    
+    return f"{base_prompt}\n\n{mode_specific}\n\n{depth_specific}\n\n{knowledge_graph_prompt}"
+
+def enhance_response_with_citations(response, context, mode):
+    """Add enhanced citations and evidence to response"""
+    if mode == "precise":
+        return add_precise_citations(response, context)
+    elif mode == "exploratory":
+        return add_exploratory_citations(response, context)
+    else:
+        return add_smart_citations(response, context)
+
+def show_relationship_visualizations(context):
+    """Show visualizations of document relationships"""
+    if st.checkbox("Show Document Relationships"):
+        st.write("### Document Relationship Graph")
+        # Here you would add code to visualize the relationships
+        # using a library like networkx or pyvis
+        pass
 
 def build_search_filter(query_intent):
     """Build Pinecone filter based on query intent"""
@@ -1602,41 +1867,6 @@ def format_document_context(metadata, score, depth, query_intent):
             """)
     
     return "\n".join(context_parts)
-
-def create_system_prompt(depth, query_intent):
-    """Create dynamic system prompt based on context depth and query intent"""
-    base_prompt = """You are an intelligent assistant analyzing a personal document archive. 
-    This archive contains various types of documents including handwritten notes, essays, medical records, 
-    receipts, and other personal papers."""
-    
-    depth_specific = {
-        "concise": "Provide brief, focused answers using only the most relevant information.",
-        "standard": "Balance detail and brevity, highlighting key information and relationships.",
-        "detailed": "Provide comprehensive answers, including supporting details, relationships, and citations."
-    }[depth]
-    
-    intent_specific = f"""
-    Focus areas based on query intent:
-    - Primary topic: {query_intent.get('primary_topic', 'general')}
-    - Temporal context: {query_intent.get('temporal_context', 'any time')}
-    - Document types: {', '.join(query_intent.get('required_document_types', ['all']))}
-    """
-    
-    return f"{base_prompt}\n\n{depth_specific}\n\n{intent_specific}"
-
-def format_citations(matches):
-    """Format document citations for detailed responses"""
-    citations = []
-    for match in matches:
-        metadata = match.metadata
-        citation = f"""
-        - {metadata.get('type', 'Document')} from {metadata.get('temporal_data', {}).get('creation_date', 'unknown date')}
-          ID: {metadata.get('document_id')}
-          Relevance: {match.score:.2f}
-          Topics: {', '.join(metadata.get('content_analysis', {}).get('topics', []))}
-        """
-        citations.append(citation)
-    return "\n".join(citations)
 
 def exchange_code_for_tokens(code):
     """Exchange authorization code for access and refresh tokens"""
@@ -2553,6 +2783,234 @@ class DocumentProcessor:
         except Exception as e:
             print(f"Error processing results: {str(e)}")
             print(traceback.format_exc())
+
+def chunk_document(text, metadata, max_chunk_size=1000):
+    """
+    Split document into semantic chunks while preserving context
+    
+    Args:
+        text (str): Full document text
+        metadata (dict): Document metadata
+        max_chunk_size (int): Maximum chunk size in characters
+    
+    Returns:
+        list: List of chunks with their metadata
+    """
+    try:
+        # Use GPT to identify semantic boundaries
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Split this text into semantic chunks. Preserve paragraph and section boundaries. Each chunk should be self-contained and meaningful."
+            }, {
+                "role": "user",
+                "content": text
+            }],
+            temperature=0.2
+        )
+        
+        chunks = json.loads(response.choices[0].message.content)
+        processed_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            # Create chunk-specific metadata
+            chunk_metadata = {
+                **metadata,  # Base metadata
+                'chunk_info': {
+                    'chunk_id': f"{metadata['document_id']}_chunk_{i}",
+                    'chunk_index': i,
+                    'total_chunks': len(chunks),
+                    'is_first_chunk': i == 0,
+                    'is_last_chunk': i == len(chunks) - 1,
+                    'semantic_context': analyze_chunk_context(chunk)
+                }
+            }
+            processed_chunks.append({
+                'text': chunk,
+                'metadata': chunk_metadata
+            })
+        
+        return processed_chunks
+    except Exception as e:
+        print(f"❌ Error chunking document: {str(e)}")
+        return [{'text': text, 'metadata': metadata}]
+
+def analyze_chunk_context(chunk_text):
+    """Analyze the semantic context of a chunk"""
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Analyze this text chunk and provide: 1) Main topic, 2) Key entities, 3) Section type (e.g., introduction, conclusion, details), 4) Information density (1-10)"
+            }, {
+                "role": "user",
+                "content": chunk_text
+            }],
+            temperature=0.2
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"❌ Error analyzing chunk context: {str(e)}")
+        return {}
+
+def analyze_document_relationships(doc_id, metadata, index):
+    """
+    Analyze relationships between documents using semantic similarity and temporal context
+    
+    Args:
+        doc_id (str): Current document ID
+        metadata (dict): Document metadata
+        index: Pinecone index
+    
+    Returns:
+        dict: Enhanced relationship metadata
+    """
+    try:
+        # Get potential related documents based on temporal proximity
+        temporal_data = metadata['temporal_data']
+        creation_date = temporal_data.get('creation_date')
+        
+        # Query for documents with similar topics or entities
+        query_embedding = create_embedding(
+            f"{' '.join(metadata['content_analysis']['key_concepts'])} {' '.join(metadata['content_analysis']['topics'])}"
+        )
+        
+        results = index.query(
+            vector=query_embedding,
+            top_k=5,
+            include_metadata=True,
+            filter={
+                'document_id': {'$ne': doc_id}  # Exclude current document
+            }
+        )
+        
+        relationships = {
+            'semantic_connections': [],
+            'temporal_connections': [],
+            'topical_threads': [],
+            'reference_chain': []
+        }
+        
+        # Analyze each potential relationship
+        for match in results.matches:
+            related_metadata = match.metadata
+            
+            # Calculate relationship strength and type
+            relationship = analyze_document_connection(
+                metadata,
+                related_metadata,
+                match.score
+            )
+            
+            if relationship['strength'] > 0.7:  # Strong relationship threshold
+                relationships['semantic_connections'].append({
+                    'document_id': related_metadata['document_id'],
+                    'relationship_type': relationship['type'],
+                    'strength': relationship['strength'],
+                    'shared_concepts': relationship['shared_concepts']
+                })
+        
+        # Update metadata with relationship information
+        metadata['relationships'] = relationships
+        
+        # Create knowledge graph connections
+        metadata['knowledge_graph'] = create_knowledge_graph_nodes(
+            doc_id,
+            metadata,
+            relationships
+        )
+        
+        return metadata
+    except Exception as e:
+        print(f"❌ Error analyzing document relationships: {str(e)}")
+        return metadata
+
+def analyze_document_connection(doc1_metadata, doc2_metadata, similarity_score):
+    """Analyze the connection between two documents"""
+    try:
+        # Prepare context for analysis
+        context = {
+            'doc1': {
+                'concepts': doc1_metadata['content_analysis']['key_concepts'],
+                'topics': doc1_metadata['content_analysis']['topics'],
+                'temporal': doc1_metadata['temporal_data']
+            },
+            'doc2': {
+                'concepts': doc2_metadata['content_analysis']['key_concepts'],
+                'topics': doc2_metadata['content_analysis']['topics'],
+                'temporal': doc2_metadata['temporal_data']
+            },
+            'similarity_score': similarity_score
+        }
+        
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
+            messages=[{
+                "role": "system",
+                "content": "Analyze the relationship between these documents and provide: 1) Relationship type (e.g., follow-up, reference, related topic), 2) Relationship strength (0-1), 3) Shared concepts"
+            }, {
+                "role": "user",
+                "content": json.dumps(context)
+            }],
+            temperature=0.2
+        )
+        
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"❌ Error analyzing document connection: {str(e)}")
+        return {'type': 'unknown', 'strength': 0, 'shared_concepts': []}
+
+def create_knowledge_graph_nodes(doc_id, metadata, relationships):
+    """Create knowledge graph representation of document connections"""
+    return {
+        'node_id': doc_id,
+        'node_type': metadata['type'],
+        'concepts': metadata['content_analysis']['key_concepts'],
+        'connections': relationships['semantic_connections'],
+        'temporal_position': metadata['temporal_data']['creation_date'],
+        'importance': metadata['content_analysis']['importance_score']
+    }
+
+# Update store_in_pinecone function to use chunking
+def store_in_pinecone(index, doc_id, extracted_text, metadata):
+    """Store document chunks in Pinecone with enhanced metadata"""
+    try:
+        # Create chunks
+        chunks = chunk_document(extracted_text, metadata)
+        success = True
+        
+        # Analyze document relationships
+        enhanced_metadata = analyze_document_relationships(doc_id, metadata, index)
+        
+        # Store each chunk
+        for chunk in chunks:
+            chunk_text = chunk['text']
+            chunk_metadata = chunk['metadata']
+            
+            # Add relationship data to chunk metadata
+            chunk_metadata['document_relationships'] = enhanced_metadata['relationships']
+            chunk_metadata['knowledge_graph'] = enhanced_metadata['knowledge_graph']
+            
+            # Create embedding for the chunk
+            chunk_embedding = create_embedding(chunk_text)
+            if not chunk_embedding:
+                print(f"❌ Failed to create embedding for chunk {chunk_metadata['chunk_info']['chunk_id']}")
+                success = False
+                continue
+            
+            # Upsert chunk to Pinecone
+            upsert_to_pinecone(
+                chunk_metadata['chunk_info']['chunk_id'],
+                chunk_embedding,
+                chunk_metadata
+            )
+        
+        return success
+    except Exception as e:
+        print(f"❌ Error storing document {doc_id} in Pinecone: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     main()
