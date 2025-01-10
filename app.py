@@ -656,15 +656,24 @@ def retrieve_all_document_ids(tokens, checkpoint):
     current_offset = 0
     
     try:
-        # First get total count
+        # First get total count with minimal filtering
         params = {
             'offset': 0,
             'limit': 1,
-            'order_by_desc': 'uploaded',
+            'include': 'attachment,stats,categories,type',
             'trashed': 'false'
         }
         
+        print("\n🔍 Checking total document count...")
+        print(f"Request URL: {list_url}")
+        print(f"Request params: {params}")
+        print(f"Request headers: {headers}")
+        
         response = requests.get(list_url, headers=headers, params=params)
+        print(f"Response status: {response.status_code}")
+        print(f"Response headers: {dict(response.headers)}")
+        print(f"Response body: {response.text}")
+        
         if response.status_code != 200:
             print(f"❌ Failed to fetch document count. Status: {response.status_code}")
             return []
@@ -673,43 +682,70 @@ def retrieve_all_document_ids(tokens, checkpoint):
         print(f"\n📊 Total documents in Shoeboxed: {total_count}")
         
         while True:
-            # Prepare query parameters
+            # Prepare query parameters with minimal filtering
             params = {
                 'offset': current_offset,
                 'limit': batch_size,
-                'order_by_desc': 'uploaded',
+                'include': 'attachment,stats,categories,type',
                 'trashed': 'false'
             }
             
             print(f"\n📡 Fetching document batch starting at offset {current_offset}")
+            print(f"Request params: {params}")
             
             response = requests.get(list_url, headers=headers, params=params)
+            print(f"Response status: {response.status_code}")
             
             if response.status_code != 200:
                 print(f"❌ Failed to fetch document list. Status: {response.status_code}")
-                break
+                print(f"Response headers: {dict(response.headers)}")
+                print(f"Response body: {response.text}")
+                print(f"Request URL: {response.url}")
+                
+                # Refresh token and retry once
+                tokens = refresh_if_needed(tokens)
+                if tokens:
+                    headers = get_shoeboxed_headers(tokens['access_token'])
+                    response = requests.get(list_url, headers=headers, params=params)
+                    if response.status_code == 200:
+                        print("✅ Request succeeded after token refresh")
+                    else:
+                        print(f"❌ Request still failed after token refresh: {response.status_code}")
+                        break
+                else:
+                    print("❌ Token refresh failed")
+                    break
             
             data = response.json()
             doc_list = data.get('documents', [])
             
             if not doc_list:
+                print("No more documents found in this batch")
                 break
+            
+            print(f"\n📄 Found {len(doc_list)} documents in current batch")
             
             # Process and filter documents
             batch_stats = {
                 'total': 0,
-                'to_process': 0
+                'to_process': 0,
+                'already_processed': 0,
+                'types': {}
             }
             
             for doc in doc_list:
                 doc_id = doc.get('id')
+                doc_type = doc.get('type', 'unknown')
+                
                 if not doc_id:
+                    print(f"⚠️ Document without ID found: {doc}")
                     continue
                 
                 batch_stats['total'] += 1
+                batch_stats['types'][doc_type] = batch_stats['types'].get(doc_type, 0) + 1
                 
-                # Only skip if successfully processed
                 if doc_id in checkpoint.processed_docs:
+                    batch_stats['already_processed'] += 1
                     continue
                 
                 batch_stats['to_process'] += 1
@@ -722,12 +758,17 @@ def retrieve_all_document_ids(tokens, checkpoint):
             # Log batch statistics
             print(f"\n📊 Batch Statistics:")
             print(f"   Total Documents: {batch_stats['total']}")
+            print(f"   Already Processed: {batch_stats['already_processed']}")
             print(f"   To Process: {batch_stats['to_process']}")
+            print(f"   Document Types Found:")
+            for doc_type, count in batch_stats['types'].items():
+                print(f"      - {doc_type}: {count}")
             print(f"   Running Total To Process: {total_to_process}")
             
             # Update offset and check if we've retrieved all documents
-            current_offset += batch_size
+            current_offset += len(doc_list)  # Use actual number of documents received
             if current_offset >= total_count:
+                print(f"Reached total count ({total_count}), stopping retrieval")
                 break
             
             time.sleep(0.5)  # Be nice to the API
