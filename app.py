@@ -1270,20 +1270,18 @@ def process_documents():
         progress_container = st.container()
         with progress_container:
             # Create metrics at the top
-            metrics_cols = st.columns(4)
-            total_metric = metrics_cols[0].empty()
-            processed_metric = metrics_cols[1].empty()
-            failed_metric = metrics_cols[2].empty()
-            skipped_metric = metrics_cols[3].empty()
+            col1, col2, col3 = st.columns(3)
+            total_metric = col1.empty()
+            processed_metric = col2.empty()
+            failed_metric = col3.empty()
             
             # Progress bar and status
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Recent activity (collapsible)
-            with st.expander("Recent Activity", expanded=False):
-                recent_activity = st.empty()
-                recent_files = st.empty()
+            # Processing details (collapsible)
+            with st.expander("Processing Details", expanded=False):
+                processing_details = st.empty()
         
         # Initialize checkpoint if not exists
         if not hasattr(st.session_state, 'processor'):
@@ -1295,22 +1293,30 @@ def process_documents():
         failed_count = len(checkpoint.failed_docs)
         skipped_count = len(checkpoint.skipped_docs)
         
-        # Update initial metrics with loading state
-        total_metric.metric("Total Documents", "Loading...")
-        processed_metric.metric("Processed", processed_count)
-        failed_metric.metric("Failed", failed_count)
-        skipped_metric.metric("Skipped", skipped_count)
-        
         # Retrieve document IDs
         print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
         all_document_ids = retrieve_all_document_ids(tokens, checkpoint)
         total_documents = len(all_document_ids)
         
-        # Update total metric now that we have the count
+        # Calculate grand total (including already processed)
+        grand_total = total_documents + processed_count + failed_count + skipped_count
+        remaining_to_process = total_documents
+        
+        # Update metrics with correct counts
         total_metric.metric(
             "Total Documents",
-            f"{total_documents + processed_count + skipped_count:,}",
-            f"{total_documents:,} to process"
+            f"{grand_total:,}",
+            f"{remaining_to_process:,} to process"
+        )
+        processed_metric.metric(
+            "Processed",
+            f"{processed_count:,}",
+            None
+        )
+        failed_metric.metric(
+            "Failed",
+            f"{failed_count:,}",
+            None
         )
         
         if total_documents == 0:
@@ -1321,11 +1327,11 @@ def process_documents():
         
         print(f"\n📊 Processing Summary:")
         print(f"{'='*80}")
-        print(f"Total Documents Found: {total_documents:,}")
-        print(f"Already in Pinecone: {processed_count:,}")
+        print(f"Total Documents: {grand_total:,}")
+        print(f"Already Processed: {processed_count:,}")
         print(f"Failed Previously: {failed_count:,}")
         print(f"Skipped: {skipped_count:,}")
-        print(f"To Be Processed: {total_documents:,}")
+        print(f"To Be Processed: {remaining_to_process:,}")
         print(f"{'='*80}\n")
         
         # Process documents in batches
@@ -1356,14 +1362,6 @@ def process_documents():
             end_idx = min(start_idx + batch_size, total_documents)
             current_batch = all_document_ids[start_idx:end_idx]
             
-            # Update progress
-            progress = (batch_index * batch_size) / total_documents
-            progress_bar.progress(min(progress, 1.0))
-            status_text.text(f"Processing batch {batch_index + 1} of {total_batches}")
-            
-            print(f"\n🔄 Processing batch {batch_index + 1} of {total_batches}")
-            print(f"   Documents {start_idx + 1} to {end_idx} of {total_documents}")
-            
             # Get document details for the batch
             batch_documents = []
             for doc_id in current_batch:
@@ -1382,40 +1380,35 @@ def process_documents():
                 batch_documents,
                 progress_bar,
                 status_text,
-                metrics_cols,
-                recent_activity,
-                recent_files
-            )
-            
-            # Update metrics after each batch
-            current_processed = len(checkpoint.processed_docs)
-            current_failed = len(checkpoint.failed_docs)
-            current_skipped = len(checkpoint.skipped_docs)
-            
-            total_metric.metric(
-                "Total Documents",
-                f"{total_documents + current_processed + current_skipped:,}",
-                f"{total_documents - (current_processed - processed_count):,} to process"
-            )
-            processed_metric.metric(
-                "Processed",
-                current_processed,
-                f"+{current_processed - processed_count}"
-            )
-            failed_metric.metric(
-                "Failed",
-                current_failed,
-                f"+{current_failed - failed_count}" if current_failed > failed_count else None
-            )
-            skipped_metric.metric(
-                "Skipped",
-                current_skipped,
-                f"+{current_skipped - skipped_count}" if current_skipped > skipped_count else None
+                [total_metric, processed_metric, failed_metric],
+                processing_details,
+                None
             )
             
             # Save checkpoint after each batch
             checkpoint.update_batch(batch_index)
             checkpoint.save_checkpoint()
+            
+            # Update metrics after batch processing
+            current_processed = len(checkpoint.processed_docs)
+            current_failed = len(checkpoint.failed_docs)
+            remaining = total_documents - (current_processed - processed_count)
+            
+            total_metric.metric(
+                "Total Documents",
+                f"{grand_total:,}",
+                f"{remaining:,} to process"
+            )
+            processed_metric.metric(
+                "Processed",
+                f"{current_processed:,}",
+                f"+{current_processed - processed_count}"
+            )
+            failed_metric.metric(
+                "Failed",
+                f"{current_failed:,}",
+                f"+{current_failed - failed_count}" if current_failed > failed_count else None
+            )
         
         # Final progress update
         progress_bar.progress(1.0)
@@ -1629,7 +1622,7 @@ def format_exploratory_context(context, depth, intent):
         graph_section = "Knowledge Graph Insights:\n"
         for node in context['knowledge_graph']['nodes']:
             graph_section += f"""
-            Topic: {node['node_type']}
+            Topic: {node['node_type']} 
             Key Concepts: {', '.join(node['concepts'])}
             Importance: {node['importance']}/10
             """
@@ -2695,9 +2688,13 @@ class DocumentProcessor:
         self.lock = threading.Lock()
         self.checkpoint = ProcessingCheckpoint()
         self.metrics = {
-            'processed': 0,
-            'failed': 0,
-            'total_time': 0
+            'total_documents': 0,
+            'total_processed': 0,
+            'batch_processed': 0,
+            'total_failed': 0,
+            'batch_failed': 0,
+            'total_time': 0,
+            'batch_time': 0
         }
     
     def process_document_worker(self):
@@ -2735,9 +2732,12 @@ class DocumentProcessor:
                     
                     with self.lock:
                         if success:
-                            self.metrics['processed'] += 1
+                            self.metrics['batch_processed'] += 1
+                            self.metrics['total_processed'] += 1
                         else:
-                            self.metrics['failed'] += 1
+                            self.metrics['batch_failed'] += 1
+                            self.metrics['total_failed'] += 1
+                        self.metrics['batch_time'] += processing_time
                         self.metrics['total_time'] += processing_time
                     
                 except Exception as e:
@@ -2750,7 +2750,9 @@ class DocumentProcessor:
                     )
                     
                     with self.lock:
-                        self.metrics['failed'] += 1
+                        self.metrics['batch_failed'] += 1
+                        self.metrics['total_failed'] += 1
+                        self.metrics['batch_time'] += time.time() - start_time
                         self.metrics['total_time'] += time.time() - start_time
                 
                 self.results_queue.put(result)
@@ -2761,13 +2763,19 @@ class DocumentProcessor:
                 print(traceback.format_exc())
                 continue
 
-    def process_batch(self, documents, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
+    def process_batch(self, documents, progress_bar, status_text, metrics_cols, processing_details, recent_files):
         """Process a batch of documents with real-time progress updates"""
         try:
+            # Reset batch metrics
+            self.metrics['batch_processed'] = 0
+            self.metrics['batch_failed'] = 0
+            self.metrics['batch_time'] = 0
+            
             # Initialize processing queue if empty
             if self.processing_queue.empty():
                 for doc in documents:
                     self.processing_queue.put(doc)
+                self.metrics['total_documents'] = len(self.checkpoint.processed_docs) + len(documents)
             
             # Create and start worker threads
             num_threads = min(MAX_THREADS, len(documents))
@@ -2777,10 +2785,11 @@ class DocumentProcessor:
                     futures.append(executor.submit(self.process_document_worker))
                 
                 # Monitor progress while threads are running
+                start_time = time.time()
                 while any(not f.done() for f in futures):
                     try:
                         # Process results and update UI
-                        self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                        self._process_results(progress_bar, status_text, metrics_cols, processing_details)
                         
                         # Update status message based on pause state
                         is_paused = st.session_state.get('paused', False)
@@ -2788,11 +2797,27 @@ class DocumentProcessor:
                         if is_paused:
                             status_text.text("⏸️ Processing paused... Click Resume to continue")
                         else:
-                            total_processed = self.metrics['processed'] + self.metrics['failed']
-                            total_docs = total_processed + self.processing_queue.qsize()
-                            if total_docs > 0:
-                                progress = total_processed / total_docs
-                                status_text.text(f"🔄 Processing: {total_processed}/{total_docs} ({progress:.1%})")
+                            total_processed = self.metrics['total_processed'] + self.metrics['total_failed']
+                            total_remaining = self.metrics['total_documents'] - total_processed
+                            
+                            if total_processed > 0:
+                                progress = total_processed / self.metrics['total_documents']
+                                elapsed_time = time.time() - start_time
+                                avg_time_per_doc = elapsed_time / total_processed
+                                est_time_remaining = total_remaining * avg_time_per_doc
+                                
+                                # Format estimated time remaining
+                                if est_time_remaining > 3600:
+                                    time_str = f"{est_time_remaining/3600:.1f} hours"
+                                elif est_time_remaining > 60:
+                                    time_str = f"{est_time_remaining/60:.1f} minutes"
+                                else:
+                                    time_str = f"{est_time_remaining:.0f} seconds"
+                                
+                                rate = total_processed / elapsed_time
+                                status_text.text(f"🔄 Progress: {progress:.1%} | Rate: {rate:.1f} docs/sec | Est. remaining: {time_str}")
+                            else:
+                                status_text.text("🔄 Starting processing...")
                         
                         time.sleep(0.1)
                     except Exception as e:
@@ -2800,7 +2825,7 @@ class DocumentProcessor:
                         continue
                 
                 # Process any remaining results
-                self._process_results(progress_bar, status_text, metrics_cols, recent_activity, recent_files)
+                self._process_results(progress_bar, status_text, metrics_cols, processing_details)
                 
                 # Wait for all workers to complete
                 concurrent.futures.wait(futures)
@@ -2809,7 +2834,7 @@ class DocumentProcessor:
             print(f"Error in process_batch: {str(e)}")
             print(traceback.format_exc())
     
-    def _process_results(self, progress_bar, status_text, metrics_cols, recent_activity, recent_files):
+    def _process_results(self, progress_bar, status_text, metrics_cols, processing_details):
         """Process results from the results queue and update UI"""
         try:
             while True:
@@ -2819,36 +2844,33 @@ class DocumentProcessor:
                     break
                 
                 # Update progress bar
-                total_processed = self.metrics['processed'] + self.metrics['failed']
-                total_docs = total_processed + self.processing_queue.qsize()
-                if total_docs > 0:
-                    progress = total_processed / total_docs
+                total_processed = self.metrics['total_processed'] + self.metrics['total_failed']
+                if self.metrics['total_documents'] > 0:
+                    progress = total_processed / self.metrics['total_documents']
                     progress_bar.progress(progress)
                 
-                # Update status text
-                if st.session_state.paused:
-                    status = "⏸️ Paused"
-                elif not st.session_state.processing_active:
-                    status = "⛔ Stopped"
-                else:
-                    status = "🔄 Processing"
-                status_text.text(f"{status}: {total_processed} of {total_docs} documents")
-                
                 # Update metrics
-                metrics_cols[0].metric("✅ Processed", self.metrics['processed'])
-                metrics_cols[1].metric("❌ Failed", self.metrics['failed'])
-                if self.metrics['total_time'] > 0:
-                    rate = total_processed / self.metrics['total_time']
-                    metrics_cols[2].metric("⚡ Rate", f"{rate:.1f} docs/sec")
+                metrics_cols[0].metric(
+                    "Total Documents",
+                    f"{self.metrics['total_documents']:,}",
+                    f"{self.metrics['total_documents'] - total_processed:,} remaining"
+                )
+                metrics_cols[1].metric(
+                    "Processed",
+                    f"{self.metrics['total_processed']:,}",
+                    f"+{self.metrics['batch_processed']}" if self.metrics['batch_processed'] > 0 else None
+                )
+                metrics_cols[2].metric(
+                    "Failed",
+                    f"{self.metrics['total_failed']:,}",
+                    f"+{self.metrics['batch_failed']}" if self.metrics['batch_failed'] > 0 else None
+                )
                 
-                # Update recent activity
+                # Log processing details
                 if result.success:
-                    recent_activity.info(f"✅ Processed document {result.doc_id}")
+                    processing_details.info(f"✅ Processed document {result.doc_id} ({result.processing_time:.1f}s)")
                 else:
-                    recent_activity.error(f"❌ Failed document {result.doc_id}: {result.error}")
-                
-                # Update recent files
-                recent_files.text(f"Last processed: {result.doc_id}")
+                    processing_details.error(f"❌ Failed document {result.doc_id}: {result.error}")
                 
         except Exception as e:
             print(f"Error processing results: {str(e)}")
