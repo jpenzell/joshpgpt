@@ -29,6 +29,8 @@ import psutil
 import spacy
 from transformers import pipeline
 import textwrap
+import re
+import math
 
 # Load environment variables
 load_dotenv()
@@ -313,37 +315,77 @@ def retry_with_backoff(func, max_retries=3, initial_delay=1):
     
     return wrapper
 
-def create_embedding(text):
-    """Create embedding with retry logic"""
-    max_retries = int(os.getenv('MAX_RETRIES', '3'))
+def create_embedding(text, chunk_size=1000, overlap=100):
+    """Create embeddings with smart chunking and dimension handling"""
+    try:
+        # Clean and normalize text
+        text = text.replace('\n', ' ').strip()
+        
+        # Smart chunking for long texts
+        if len(text) > chunk_size:
+            chunks = []
+            start = 0
+            while start < len(text):
+                # Find the end of the current chunk
+                end = start + chunk_size
+                if end < len(text):
+                    # Try to end at a sentence boundary
+                    next_period = text.find('.', end - 50, end + 50)
+                    if next_period != -1:
+                        end = next_period + 1
+                
+                chunk = text[start:end].strip()
+                if chunk:
+                    chunks.append(chunk)
+                start = end - overlap  # Create overlap between chunks
+        else:
+            chunks = [text]
+        
+        # Create embeddings for each chunk
+        embeddings = []
+        for chunk in chunks:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = client.embeddings.create(
+                        model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
+                        input=chunk,
+                        dimensions=EMBEDDING_DIMENSIONS
+                    )
+                    chunk_embedding = response.data[0].embedding
+                    embeddings.append(chunk_embedding)
+                    break
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1:
+                        raise e
+                    time.sleep(2 ** attempt)  # Exponential backoff
+        
+        if not embeddings:
+            return None
+        
+        # If we have multiple chunks, combine them
+        if len(embeddings) > 1:
+            # Average the embeddings (weighted by chunk lengths)
+            weights = [len(chunk) for chunk in chunks]
+            total_weight = sum(weights)
+            weights = [w/total_weight for w in weights]
+            
+            combined_embedding = []
+            for i in range(len(embeddings[0])):
+                value = sum(emb[i] * weight for emb, weight in zip(embeddings, weights))
+                combined_embedding.append(value)
+            
+            # Normalize the combined embedding
+            magnitude = math.sqrt(sum(x*x for x in combined_embedding))
+            if magnitude > 0:
+                combined_embedding = [x/magnitude for x in combined_embedding]
+            
+            return combined_embedding
+        
+        return embeddings[0]
     
-    for attempt in range(max_retries):
-        try:
-            print(f"Creating embedding (attempt {attempt + 1}/{max_retries})")
-            response = client.embeddings.create(
-                model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
-                input=text,
-                dimensions=EMBEDDING_DIMENSIONS
-            )
-            
-            embedding = response.data[0].embedding
-            
-            # Verify embedding dimension
-            if len(embedding) != EMBEDDING_DIMENSIONS:
-                print(f"Warning: Unexpected embedding dimension {len(embedding)}, expected {EMBEDDING_DIMENSIONS}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return None
-            
-            return embedding
-            
-        except Exception as e:
-            print(f"Error creating embedding: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                return None
+    except Exception as e:
+        print(f"Error creating embedding: {str(e)}")
+        return None
 
 @retry_with_backoff
 def extract_text_with_vision(image_base64):
@@ -610,141 +652,225 @@ def upload_to_s3(file_content, doc_id, content_type):
         print(f"Error uploading to S3: {str(e)}")
         return None
 
-def extract_enhanced_metadata(text, doc):
-    """Extract enhanced metadata from document text"""
+def extract_enhanced_metadata(text, doc_id, doc_type, vendor, total, upload_date, categories):
     try:
-        # Process with spaCy
+        # Get NLP model for entity extraction
         nlp = get_nlp()
-        doc_nlp = nlp(text)
+        doc = nlp(text)
         
-        # Extract entities
+        # Extract entities with context
         entities = {
-            'people': [ent.text for ent in doc_nlp.ents if ent.label_ == 'PERSON'],
-            'organizations': [ent.text for ent in doc_nlp.ents if ent.label_ == 'ORG'],
-            'locations': [ent.text for ent in doc_nlp.ents if ent.label_ == 'GPE'],
-            'dates': [ent.text for ent in doc_nlp.ents if ent.label_ == 'DATE']
+            "people": [],
+            "organizations": [],
+            "locations": [],
+            "dates": [],
+            "money": [],
+            "misc": []
         }
         
-        # Document classification
-        doc_types = ["essay", "note", "receipt", "tax_document", "correspondence", "medical_record"]
-        zero_shot_classifier = get_zero_shot_classifier()
-        classification = zero_shot_classifier(text, doc_types)
+        for ent in doc.ents:
+            if ent.label_ in ["PERSON"]:
+                entities["people"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            elif ent.label_ in ["ORG"]:
+                entities["organizations"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            elif ent.label_ in ["GPE", "LOC"]:
+                entities["locations"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            elif ent.label_ in ["DATE", "TIME"]:
+                entities["dates"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            elif ent.label_ in ["MONEY"]:
+                entities["money"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            else:
+                entities["misc"].append({"text": ent.text, "label": ent.label_, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+
+        # Extract key phrases and topics
+        key_phrases = []
+        for chunk in doc.noun_chunks:
+            if len(chunk.text.split()) >= 2:  # Only phrases with 2+ words
+                key_phrases.append(chunk.text)
         
-        # Generate summary if text is long enough
-        summary = ""
-        if len(text.split()) > 50:
-            summarizer = get_summarizer()
-            summary = summarizer(text, max_length=130, min_length=30, do_sample=False)[0]['summary_text']
-        
-        # Extract topics using basic keyword extraction
-        keywords = [token.text for token in doc_nlp if token.is_alpha and not token.is_stop]
-        topics = list(set([word.lower() for word in keywords]))[:10]
-        
+        # Get document topics using zero-shot classification
+        classifier = get_zero_shot_classifier()
+        candidate_topics = [
+            "travel", "expenses", "invoice", "receipt", "contract",
+            "legal document", "correspondence", "financial statement",
+            "medical record", "identification", "insurance", "utility"
+        ]
+        topic_results = classifier(text, candidate_topics, multi_label=True)
+        topics = [{"label": label, "score": score} for label, score in zip(topic_results['labels'], topic_results['scores']) if score > 0.5]
+
+        # Create cognitive metadata
+        cognitive_metadata = {
+            "semantic_context": {
+                "key_concepts": key_phrases[:10],  # Top 10 key phrases
+                "main_topics": [t["label"] for t in topics],
+                "entities": entities
+            },
+            "temporal_context": {
+                "document_date": upload_date,
+                "extracted_dates": list(set([date["text"] for date in entities["dates"]])),
+                "temporal_references": extract_time_references(text)
+            },
+            "relational_context": {
+                "document_chain": identify_document_chain(text, doc_type),
+                "references": extract_references(text),
+                "document_thread": identify_document_thread(doc_id, doc_type, upload_date)
+            }
+        }
+
+        # Create knowledge graph elements
+        knowledge_graph = {
+            "knowledge_nodes": {
+                "primary_entity": f"{doc_type}_{doc_id}",
+                "entity_type": determine_entity_type(doc_type, text),
+                "connected_entities": extract_connected_entities(entities)
+            },
+            "relationships": {
+                "part_of": identify_broader_context(text, doc_type),
+                "associated_with": extract_associated_ids(text)
+            },
+            "context_vectors": {
+                "purpose_vector": determine_document_purpose(text),
+                "activity_vector": determine_activity_type(text),
+                "location_vector": determine_location_context(entities["locations"])
+            }
+        }
+
+        # Create AI-optimized retrieval tags
+        retrieval_tags = {
+            "retrieval_contexts": {
+                "time_based": generate_time_contexts(upload_date, entities["dates"]),
+                "purpose_based": [t["label"] for t in topics],
+                "expense_based": categories if categories else []
+            },
+            "semantic_markers": {
+                "document_importance": calculate_importance(text, entities),
+                "information_completeness": calculate_completeness(text, doc_type),
+                "verification_status": "verified" if has_verification_markers(text) else "unverified"
+            },
+            "query_optimization": {
+                "primary_search_terms": extract_search_terms(text),
+                "semantic_categories": determine_semantic_categories(doc_type, text),
+                "temporal_markers": determine_temporal_markers(upload_date, text)
+            }
+        }
+
         return {
-            'entities': entities,
-            'doc_type': classification['labels'][0],
-            'doc_type_confidence': classification['scores'][0],
-            'summary': summary,
-            'topics': topics,
-            'source': doc.get('source', 'unknown'),
-            'processed_date': datetime.now().isoformat(),
-            'original_date': doc.get('created', 'unknown'),
-            'language': doc_nlp.lang_,
-            'word_count': len(text.split())
+            "document_id": doc_id,
+            "type": doc_type,
+            "vendor": vendor,
+            "total": total,
+            "uploaded_date": upload_date,
+            "categories": categories,
+            "cognitive_metadata": cognitive_metadata,
+            "knowledge_graph": knowledge_graph,
+            "retrieval_tags": retrieval_tags,
+            "text": text
         }
+
     except Exception as e:
-        print(f"Error extracting enhanced metadata: {str(e)}")
+        print(f"Error in metadata extraction: {str(e)}")
         return {
-            'entities': {},
-            'doc_type': 'unknown',
-            'doc_type_confidence': 0.0,
-            'summary': '',
-            'topics': [],
-            'source': doc.get('source', 'unknown'),
-            'processed_date': datetime.now().isoformat(),
-            'original_date': doc.get('created', 'unknown'),
-            'language': 'en',
-            'word_count': len(text.split())
+            "document_id": doc_id,
+            "type": doc_type,
+            "vendor": vendor,
+            "total": total,
+            "uploaded_date": upload_date,
+            "categories": categories,
+            "text": text
         }
+
+# Helper functions for metadata extraction
+def extract_time_references(text):
+    """Extract temporal references from text using regex patterns"""
+    patterns = {
+        "past": r"(?i)(last|previous|past|earlier|before) (?:\d+ )?(day|week|month|year|quarter)",
+        "present": r"(?i)(current|ongoing|present|this) (?:day|week|month|year|quarter)",
+        "future": r"(?i)(next|upcoming|future|following) (?:\d+ )?(day|week|month|year|quarter)"
+    }
+    references = {}
+    for time_context, pattern in patterns.items():
+        matches = re.findall(pattern, text)
+        if matches:
+            references[time_context] = [m[0] + " " + m[1] for m in matches]
+    return references
+
+def identify_document_chain(text, doc_type):
+    """Identify the document's place in a potential chain of related documents"""
+    chains = {
+        "receipt": ["order", "invoice", "receipt", "refund"],
+        "invoice": ["quote", "order", "invoice", "payment"],
+        "contract": ["draft", "review", "final", "amendment"],
+        "correspondence": ["initial", "follow_up", "response", "conclusion"]
+    }
+    return chains.get(doc_type, ["standalone"])
+
+def determine_entity_type(doc_type, text):
+    """Determine the specific entity type based on document content"""
+    if "travel" in text.lower():
+        return "travel_document"
+    if "invoice" in text.lower():
+        return "financial_document"
+    if "contract" in text.lower():
+        return "legal_document"
+    return f"general_{doc_type}"
 
 def process_single_document(doc, access_token, checkpoint):
     """Process a single document and upload to Pinecone"""
-    doc_id = doc['id']
-    temp_files = []  # Track files to cleanup
-    
-    print(f"\n{'='*80}")
-    print(f"🔍 Processing document: {doc_id}")
-    print(f"Document Details:")
-    print(f"  - Type: {doc.get('type', 'Unknown')}")
-    print(f"  - Created: {doc.get('created', 'N/A')}")
-    print(f"  - Modified: {doc.get('modified', 'N/A')}")
-    print(f"  - Category: {doc.get('category', 'Uncategorized')}")
-    print(f"  - Total: ${doc.get('total', 0.0)}")
-    print(f"  - Processing State: {doc.get('processingState', 'Unknown')}")
-    print(f"{'='*80}\n")
-    
     try:
-        # 1. Download document
-        print(f"📥 Downloading document...")
-        pdf_data = download_document(doc, access_token)
+        doc_id = doc['id']
+        print(f"\n📄 Processing document {doc_id}")
+        
+        # Download PDF
+        print("📥 Downloading PDF...")
+        pdf_data = download_pdf(doc, access_token)
         if not pdf_data:
-            print("❌ Failed to download document")
             checkpoint.mark_failed(doc_id, "Download failed")
             return False
-            
-        # Save temporarily
-        os.makedirs('documents', exist_ok=True)
-        temp_pdf_path = os.path.join('documents', f"{doc_id}.pdf")
-        temp_files.append(temp_pdf_path)  # Track for cleanup
         
-        with open(temp_pdf_path, 'wb') as f:
+        # Save PDF locally
+        local_file_path = f"documents_{doc_id}/document.pdf"
+        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+        with open(local_file_path, 'wb') as f:
             f.write(pdf_data)
-        print(f"✅ Successfully downloaded {len(pdf_data):,} bytes")
-        print(f"💾 Saved temporarily to: {temp_pdf_path}")
+        print("✅ PDF saved locally")
         
-        # 2. Extract text
-        print("\n🔤 Extracting text with GPT-4o Vision...")
+        # Extract text
+        print("\n📝 Extracting text...")
         text = extract_text_from_pdf(doc, access_token)
         if not text:
-            print("❌ Failed to extract text")
             checkpoint.mark_failed(doc_id, "Text extraction failed")
             return False
         print(f"✅ Successfully extracted {len(text):,} characters")
-        print(f"📝 Sample text: {text[:200]}...")
         
-        # 3. Create embedding
-        print("\n🧮 Creating vector embedding...")
+        # Extract enhanced metadata
+        print("\n🔍 Extracting metadata...")
+        metadata = extract_enhanced_metadata(text, doc_id, doc['type'], doc['vendor'], doc['total'], doc['created'], doc['category'])
+        print("✅ Metadata extracted")
+        
+        # Create embedding
+        print("\n🧮 Creating embedding...")
         embedding = create_embedding(text)
         if not embedding:
-            print("❌ Failed to create embedding")
             checkpoint.mark_failed(doc_id, "Embedding creation failed")
             return False
         print(f"✅ Created embedding vector of length {len(embedding)}")
-        
-        # 4. Prepare metadata and upload to Pinecone
-        print("\n📋 Preparing metadata...")
-        metadata = {
-            'id': str(doc_id),
-            'type': doc.get('type', 'unknown'),
-            'created': str(doc.get('created', '')),
-            'modified': str(doc.get('modified', '')),
-            'category': str(doc.get('category', 'Uncategorized')),
-            'total': float(doc.get('total', 0.0)) if doc.get('total') is not None else 0.0,
-            'text': text[:3000],  # Store first 3000 chars for context
-            'processed_date': datetime.now().isoformat()
-        }
-        print("✅ Metadata prepared")
         
         # Initialize Pinecone
         print("\n🔄 Connecting to Pinecone...")
         index = init_pinecone()
         if not index:
-            print("❌ Failed to initialize Pinecone")
             checkpoint.mark_failed(doc_id, "Pinecone initialization failed")
             return False
         
+        # Analyze relationships with other documents
+        print("\n🔗 Analyzing document relationships...")
+        relationships = analyze_document_relationships(doc_id, text, metadata, index)
+        if relationships:
+            metadata['relationships'] = relationships
+            print(f"✅ Found relationships with {len(relationships.get('similar_documents', []))} documents")
+        
         # Upload to Pinecone
-        print("📤 Upserting to Pinecone...")
+        print("\n📤 Upserting to Pinecone...")
         try:
             index.upsert(vectors=[(str(doc_id), embedding, metadata)])
             print("✅ Successfully upserted to Pinecone")
@@ -752,65 +878,232 @@ def process_single_document(doc, access_token, checkpoint):
             print(f"❌ Failed to upsert to Pinecone: {str(e)}")
             checkpoint.mark_failed(doc_id, f"Pinecone upsert failed: {str(e)}")
             return False
-            
-        # 5. Upload to S3
+        
+        # Upload to S3
         print("\n☁️ Uploading to S3...")
         s3_url = upload_to_s3(pdf_data, doc_id, 'application/pdf')
         if not s3_url:
-            print("❌ Failed to upload to S3")
             checkpoint.mark_failed(doc_id, "S3 upload failed")
             return False
         print(f"✅ Successfully uploaded to S3: {s3_url}")
         
-        # Update metadata with S3 URL
+        # Update metadata with S3 URL and mark as processed
         try:
             metadata['s3_url'] = s3_url
+            metadata['processing_status'] = 'completed'
+            metadata['last_updated'] = datetime.now().isoformat()
             index.upsert(vectors=[(str(doc_id), embedding, metadata)])
-            print("✅ Updated Pinecone with S3 URL")
+            print("✅ Updated Pinecone with final metadata")
+            return True
         except Exception as e:
             print(f"⚠️ Warning: Failed to update Pinecone with S3 URL: {str(e)}")
-            # Don't fail the process for this
-        
-        # 6. Cleanup temporary files
-        print("\n🧹 Cleaning up temporary files...")
-        cleanup_success = True
-        for temp_file in temp_files:
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    print(f"✅ Deleted: {temp_file}")
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to delete {temp_file}: {str(e)}")
-                cleanup_success = False
-        
-        if cleanup_success:
-            print("✅ All temporary files cleaned up")
-        else:
-            print("⚠️ Some files could not be deleted")
-        
-        # 7. Mark as processed and save state
-        checkpoint.mark_processed(doc_id)
-        print(f"\n✅ Document {doc_id} successfully processed!")
-        print(f"{'='*80}")
-        return True
+            return True  # Still consider it successful as the document is processed
         
     except Exception as e:
-        error_msg = f"Error processing document: {str(e)}"
-        print(f"\n❌ {error_msg}")
-        print(f"Traceback: {traceback.format_exc()}")
-        checkpoint.mark_failed(doc_id, error_msg)
+        print(f"❌ Error processing document: {str(e)}")
+        checkpoint.mark_failed(doc_id, f"Processing failed: {str(e)}")
         return False
+
+def extract_references(text):
+    """Extract references to other documents from text"""
+    reference_patterns = {
+        "invoice": r"(?i)invoice\s*#?\s*([A-Z0-9-]+)",
+        "order": r"(?i)order\s*#?\s*([A-Z0-9-]+)",
+        "contract": r"(?i)contract\s*#?\s*([A-Z0-9-]+)",
+        "case": r"(?i)case\s*#?\s*([A-Z0-9-]+)"
+    }
+    references = {}
+    for ref_type, pattern in reference_patterns.items():
+        matches = re.findall(pattern, text)
+        if matches:
+            references[ref_type] = matches
+    return references
+
+def identify_document_thread(doc_id, doc_type, upload_date):
+    """Identify the document's thread based on type and temporal proximity"""
+    return {
+        "thread_id": f"thread_{doc_type}_{upload_date[:7]}",  # Group by month
+        "position": "standalone",  # Will be updated when relationships are analyzed
+        "thread_context": doc_type
+    }
+
+def extract_connected_entities(entities):
+    """Extract connected entities from the entities dictionary"""
+    connected = {}
+    for entity_type, entity_list in entities.items():
+        if entity_list:
+            connected[entity_type] = [{"text": e["text"], "frequency": 1} for e in entity_list]
+    return connected
+
+def identify_broader_context(text, doc_type):
+    """Identify the broader context this document belongs to"""
+    contexts = {
+        "receipt": ["purchase", "transaction", "expense"],
+        "invoice": ["billing", "payment", "accounts_receivable"],
+        "contract": ["agreement", "legal", "business_relationship"],
+        "correspondence": ["communication", "customer_service", "inquiry"]
+    }
+    return contexts.get(doc_type, ["general"])
+
+def extract_associated_ids(text):
+    """Extract associated IDs from text"""
+    id_patterns = {
+        "transaction": r"(?i)transaction\s*#?\s*([A-Z0-9-]+)",
+        "reference": r"(?i)ref\s*#?\s*([A-Z0-9-]+)",
+        "account": r"(?i)account\s*#?\s*([A-Z0-9-]+)"
+    }
+    associated_ids = {}
+    for id_type, pattern in id_patterns.items():
+        matches = re.findall(pattern, text)
+        if matches:
+            associated_ids[id_type] = matches
+    return associated_ids
+
+def determine_document_purpose(text):
+    """Determine the purpose vector of the document"""
+    purposes = {
+        "transactional": any(word in text.lower() for word in ["payment", "invoice", "receipt", "transaction"]),
+        "informational": any(word in text.lower() for word in ["notice", "announcement", "information", "update"]),
+        "contractual": any(word in text.lower() for word in ["agreement", "contract", "terms", "conditions"]),
+        "correspondence": any(word in text.lower() for word in ["letter", "email", "message", "reply"])
+    }
+    return [k for k, v in purposes.items() if v]
+
+def determine_activity_type(text):
+    """Determine the type of activity represented in the document"""
+    activities = {
+        "purchase": any(word in text.lower() for word in ["bought", "purchased", "order", "buy"]),
+        "travel": any(word in text.lower() for word in ["flight", "hotel", "travel", "trip"]),
+        "service": any(word in text.lower() for word in ["service", "consultation", "appointment"]),
+        "subscription": any(word in text.lower() for word in ["subscription", "recurring", "monthly", "annual"])
+    }
+    return [k for k, v in activities.items() if v]
+
+def determine_location_context(locations):
+    """Determine the location context from extracted locations"""
+    if not locations:
+        return []
+    return [loc["text"] for loc in locations[:3]]  # Return top 3 locations
+
+def generate_time_contexts(upload_date, date_entities):
+    """Generate time-based retrieval contexts"""
+    contexts = []
+    try:
+        upload_dt = datetime.fromisoformat(upload_date.replace('Z', '+00:00'))
+        contexts.append(f"year_{upload_dt.year}")
+        contexts.append(f"month_{upload_dt.year}_{upload_dt.month:02d}")
+        contexts.append(f"quarter_{upload_dt.year}_Q{(upload_dt.month-1)//3 + 1}")
+    except (ValueError, AttributeError):
+        pass
+    
+    # Add extracted dates
+    for date in date_entities:
+        contexts.append(f"date_mentioned_{date['text']}")
+    
+    return contexts
+
+def calculate_importance(text, entities):
+    """Calculate document importance based on various factors"""
+    importance_score = 0
+    
+    # Check for urgent indicators
+    if any(word in text.lower() for word in ["urgent", "important", "priority", "asap"]):
+        importance_score += 2
         
-    finally:
-        # Ensure cleanup happens even if there's an error
-        print("\n🧹 Final cleanup...")
-        for temp_file in temp_files:
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    print(f"✅ Deleted: {temp_file}")
-            except Exception as e:
-                print(f"⚠️ Warning: Could not delete {temp_file}: {str(e)}")
+    # Check for monetary value
+    if entities["money"]:
+        importance_score += 1
+        
+    # Check for multiple involved parties
+    if len(entities["people"]) + len(entities["organizations"]) > 2:
+        importance_score += 1
+        
+    # Check for action items
+    if any(word in text.lower() for word in ["required", "must", "deadline", "action"]):
+        importance_score += 1
+        
+    return min(5, importance_score)  # Scale from 0-5
+
+def calculate_completeness(text, doc_type):
+    """Calculate completeness score based on document type requirements"""
+    required_elements = {
+        "receipt": ["total", "date", "vendor"],
+        "invoice": ["total", "date", "vendor", "invoice number"],
+        "contract": ["parties", "date", "terms", "signatures"],
+        "correspondence": ["sender", "recipient", "date", "subject"]
+    }
+    
+    elements = required_elements.get(doc_type, ["date", "content"])
+    present_elements = sum(1 for element in elements if element.lower() in text.lower())
+    total_elements = len(elements)
+    
+    return round(present_elements / total_elements, 2) if total_elements > 0 else 0.0
+
+def has_verification_markers(text):
+    """Check for verification markers in the document"""
+    verification_indicators = [
+        "verified", "approved", "confirmed", "authorized",
+        "signature", "authenticated", "validated"
+    ]
+    return any(indicator in text.lower() for indicator in verification_indicators)
+
+def extract_search_terms(text):
+    """Extract primary search terms from the document"""
+    # Get NLP model
+    nlp = get_nlp()
+    doc = nlp(text)
+    
+    # Extract important terms
+    terms = []
+    for token in doc:
+        if token.pos_ in ["NOUN", "PROPN"] and not token.is_stop:
+            terms.append(token.text)
+    
+    # Remove duplicates and limit
+    return list(set(terms))[:10]
+
+def determine_semantic_categories(doc_type, text):
+    """Determine semantic categories for the document"""
+    categories = set()
+    
+    # Add document type category
+    categories.add(doc_type)
+    
+    # Check for business context
+    if any(word in text.lower() for word in ["business", "corporate", "company", "enterprise"]):
+        categories.add("business")
+        
+    # Check for personal context
+    if any(word in text.lower() for word in ["personal", "individual", "private"]):
+        categories.add("personal")
+        
+    # Check for financial context
+    if any(word in text.lower() for word in ["payment", "invoice", "money", "cost"]):
+        categories.add("financial")
+        
+    return list(categories)
+
+def determine_temporal_markers(upload_date, text):
+    """Determine temporal markers for the document"""
+    markers = []
+    try:
+        upload_dt = datetime.fromisoformat(upload_date.replace('Z', '+00:00'))
+        markers.append(f"year_{upload_dt.year}")
+        markers.append(f"month_{upload_dt.strftime('%B').lower()}")
+        markers.append(f"quarter_Q{(upload_dt.month-1)//3 + 1}")
+        
+        # Add temporal context
+        if "urgent" in text.lower() or "asap" in text.lower():
+            markers.append("urgent")
+        if "deadline" in text.lower():
+            markers.append("deadline")
+        if any(word in text.lower() for word in ["recurring", "monthly", "annual"]):
+            markers.append("recurring")
+            
+    except (ValueError, AttributeError):
+        pass
+        
+    return markers
 
 def main():
     global should_continue
