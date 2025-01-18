@@ -653,12 +653,25 @@ def upload_to_s3(file_content, doc_id, content_type):
         return None
 
 def extract_enhanced_metadata(text, doc_id, doc_type, vendor, total, upload_date, categories):
+    """Extract enhanced metadata from document text"""
     try:
+        # Initialize base metadata (maintaining backward compatibility)
+        metadata = {
+            "document_id": doc_id,
+            "type": doc_type,
+            "vendor": vendor,
+            "total": total,
+            "uploaded_date": upload_date,
+            "categories": categories,
+            "text": text,
+            "version": "2.0"  # Version tracking for future compatibility
+        }
+
         # Get NLP model for entity extraction
         nlp = get_nlp()
         doc = nlp(text)
-        
-        # Extract entities with context
+
+        # Enhanced entity extraction
         entities = {
             "people": [],
             "organizations": [],
@@ -669,106 +682,77 @@ def extract_enhanced_metadata(text, doc_id, doc_type, vendor, total, upload_date
         }
         
         for ent in doc.ents:
-            if ent.label_ in ["PERSON"]:
-                entities["people"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
-            elif ent.label_ in ["ORG"]:
-                entities["organizations"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
-            elif ent.label_ in ["GPE", "LOC"]:
-                entities["locations"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
-            elif ent.label_ in ["DATE", "TIME"]:
-                entities["dates"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
-            elif ent.label_ in ["MONEY"]:
-                entities["money"].append({"text": ent.text, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
-            else:
-                entities["misc"].append({"text": ent.text, "label": ent.label_, "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]})
+            if ent.label_ in ["PERSON", "ORG", "GPE", "DATE", "MONEY"]:
+                entities[ent.label_.lower() + "s"].append({
+                    "text": ent.text,
+                    "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]
+                })
 
-        # Extract key phrases and topics
-        key_phrases = []
-        for chunk in doc.noun_chunks:
-            if len(chunk.text.split()) >= 2:  # Only phrases with 2+ words
-                key_phrases.append(chunk.text)
-        
-        # Get document topics using zero-shot classification
-        classifier = get_zero_shot_classifier()
-        candidate_topics = [
-            "travel", "expenses", "invoice", "receipt", "contract",
-            "legal document", "correspondence", "financial statement",
-            "medical record", "identification", "insurance", "utility"
-        ]
-        topic_results = classifier(text, candidate_topics, multi_label=True)
-        topics = [{"label": label, "score": score} for label, score in zip(topic_results['labels'], topic_results['scores']) if score > 0.5]
-
-        # Create cognitive metadata
-        cognitive_metadata = {
-            "semantic_context": {
-                "key_concepts": key_phrases[:10],  # Top 10 key phrases
-                "main_topics": [t["label"] for t in topics],
-                "entities": entities
-            },
-            "temporal_context": {
-                "document_date": upload_date,
-                "extracted_dates": list(set([date["text"] for date in entities["dates"]])),
-                "temporal_references": extract_time_references(text)
-            },
-            "relational_context": {
-                "document_chain": identify_document_chain(text, doc_type),
-                "references": extract_references(text),
-                "document_thread": identify_document_thread(doc_id, doc_type, upload_date)
-            }
+        # Document Intelligence
+        metadata["cognitive"] = {
+            "document_purpose": determine_document_purpose(text),
+            "priority_level": calculate_priority(text, entities),
+            "confidentiality": determine_confidentiality(text),
+            "action_items": extract_action_items(text),
+            "deadlines": extract_dates(text, filter_type="deadline")
         }
 
-        # Create knowledge graph elements
-        knowledge_graph = {
-            "knowledge_nodes": {
-                "primary_entity": f"{doc_type}_{doc_id}",
-                "entity_type": determine_entity_type(doc_type, text),
-                "connected_entities": extract_connected_entities(entities)
-            },
-            "relationships": {
-                "part_of": identify_broader_context(text, doc_type),
-                "associated_with": extract_associated_ids(text)
-            },
-            "context_vectors": {
-                "purpose_vector": determine_document_purpose(text),
-                "activity_vector": determine_activity_type(text),
-                "location_vector": determine_location_context(entities["locations"])
-            }
+        # Content Analysis
+        metadata["content"] = {
+            "key_topics": extract_key_topics(text),
+            "projects": extract_project_references(text),
+            "decisions": extract_decisions(text),
+            "next_steps": extract_next_steps(text),
+            "stakeholders": identify_stakeholders(entities)
         }
 
-        # Create AI-optimized retrieval tags
-        retrieval_tags = {
-            "retrieval_contexts": {
-                "time_based": generate_time_contexts(upload_date, entities["dates"]),
-                "purpose_based": [t["label"] for t in topics],
-                "expense_based": categories if categories else []
-            },
-            "semantic_markers": {
-                "document_importance": calculate_importance(text, entities),
-                "information_completeness": calculate_completeness(text, doc_type),
-                "verification_status": "verified" if has_verification_markers(text) else "unverified"
-            },
-            "query_optimization": {
-                "primary_search_terms": extract_search_terms(text),
-                "semantic_categories": determine_semantic_categories(doc_type, text),
-                "temporal_markers": determine_temporal_markers(upload_date, text)
-            }
+        # Business Context
+        metadata["business"] = {
+            "business_unit": extract_business_unit(text),
+            "cost_center": extract_cost_center(text),
+            "budget_refs": extract_budget_references(text),
+            "approval_chain": extract_approval_chain(text),
+            "compliance_tags": identify_compliance_items(text)
         }
 
-        return {
-            "document_id": doc_id,
-            "type": doc_type,
-            "vendor": vendor,
-            "total": total,
-            "uploaded_date": upload_date,
-            "categories": categories,
-            "cognitive_metadata": cognitive_metadata,
-            "knowledge_graph": knowledge_graph,
-            "retrieval_tags": retrieval_tags,
-            "text": text
+        # Temporal Context
+        metadata["temporal"] = {
+            "effective_date": extract_dates(text, filter_type="effective"),
+            "expiration_date": extract_dates(text, filter_type="expiration"),
+            "review_date": extract_dates(text, filter_type="review"),
+            "related_events": extract_events(text),
+            "timeline": extract_timeline_markers(text)
         }
+
+        # Relationship Mapping
+        metadata["relationships"] = {
+            "preceding_docs": extract_document_references(text, "previous"),
+            "related_docs": extract_document_references(text, "related"),
+            "supersedes": extract_document_references(text, "supersedes"),
+            "dependencies": extract_dependencies(text),
+            "child_docs": extract_document_references(text, "child")
+        }
+
+        # Knowledge Graph Elements
+        metadata["knowledge_graph"] = {
+            "nodes": extract_knowledge_nodes(text),
+            "edges": extract_relationships(text),
+            "context_vectors": create_context_vectors(text)
+        }
+
+        # AI-Optimized Retrieval Tags
+        metadata["retrieval_optimization"] = {
+            "semantic_markers": generate_semantic_markers(text),
+            "temporal_markers": generate_temporal_markers(upload_date, text),
+            "entity_markers": generate_entity_markers(entities),
+            "importance_score": calculate_importance(text, entities)
+        }
+
+        return metadata
 
     except Exception as e:
-        print(f"Error in metadata extraction: {str(e)}")
+        print(f"Error extracting enhanced metadata: {str(e)}")
+        # Return basic metadata if enhancement fails (maintaining backward compatibility)
         return {
             "document_id": doc_id,
             "type": doc_type,
@@ -776,43 +760,57 @@ def extract_enhanced_metadata(text, doc_id, doc_type, vendor, total, upload_date
             "total": total,
             "uploaded_date": upload_date,
             "categories": categories,
-            "text": text
+            "text": text,
+            "version": "1.0"
         }
 
-# Helper functions for metadata extraction
-def extract_time_references(text):
-    """Extract temporal references from text using regex patterns"""
-    patterns = {
-        "past": r"(?i)(last|previous|past|earlier|before) (?:\d+ )?(day|week|month|year|quarter)",
-        "present": r"(?i)(current|ongoing|present|this) (?:day|week|month|year|quarter)",
-        "future": r"(?i)(next|upcoming|future|following) (?:\d+ )?(day|week|month|year|quarter)"
-    }
-    references = {}
-    for time_context, pattern in patterns.items():
-        matches = re.findall(pattern, text)
-        if matches:
-            references[time_context] = [m[0] + " " + m[1] for m in matches]
-    return references
+def determine_document_purpose(text):
+    """Determine the primary purpose of the document"""
+    try:
+        classifier = get_zero_shot_classifier()
+        candidate_labels = [
+            "meeting_notes", "contract", "correspondence", "report",
+            "proposal", "invoice", "policy", "presentation",
+            "agreement", "memo", "specification", "review"
+        ]
+        result = classifier(text, candidate_labels)
+        return {
+            "primary": result["labels"][0],
+            "confidence": result["scores"][0],
+            "secondary": result["labels"][1] if len(result["labels"]) > 1 else None
+        }
+    except Exception as e:
+        print(f"Error determining document purpose: {str(e)}")
+        return {"primary": "unknown", "confidence": 0.0, "secondary": None}
 
-def identify_document_chain(text, doc_type):
-    """Identify the document's place in a potential chain of related documents"""
-    chains = {
-        "receipt": ["order", "invoice", "receipt", "refund"],
-        "invoice": ["quote", "order", "invoice", "payment"],
-        "contract": ["draft", "review", "final", "amendment"],
-        "correspondence": ["initial", "follow_up", "response", "conclusion"]
-    }
-    return chains.get(doc_type, ["standalone"])
-
-def determine_entity_type(doc_type, text):
-    """Determine the specific entity type based on document content"""
-    if "travel" in text.lower():
-        return "travel_document"
-    if "invoice" in text.lower():
-        return "financial_document"
-    if "contract" in text.lower():
-        return "legal_document"
-    return f"general_{doc_type}"
+def calculate_priority(text, entities):
+    """Calculate document priority based on content analysis"""
+    try:
+        priority_indicators = {
+            "high": ["urgent", "immediate", "critical", "asap", "deadline"],
+            "medium": ["important", "significant", "needed", "required"],
+            "low": ["fyi", "information", "update", "routine"]
+        }
+        
+        # Count priority indicators
+        scores = {level: sum(1 for word in words if word.lower() in text.lower())
+                 for level, words in priority_indicators.items()}
+        
+        # Consider entity presence
+        if len(entities["people"]) > 3 or len(entities["organizations"]) > 2:
+            scores["high"] += 1
+            
+        # Return highest scoring priority
+        max_priority = max(scores.items(), key=lambda x: x[1])
+        return {
+            "level": max_priority[0],
+            "score": max_priority[1],
+            "indicators": [word for word in priority_indicators[max_priority[0]] 
+                         if word.lower() in text.lower()]
+        }
+    except Exception as e:
+        print(f"Error calculating priority: {str(e)}")
+        return {"level": "medium", "score": 0, "indicators": []}
 
 def process_single_document(doc, access_token, checkpoint):
     """Process a single document and upload to Pinecone"""
@@ -960,14 +958,23 @@ def extract_associated_ids(text):
     return associated_ids
 
 def determine_document_purpose(text):
-    """Determine the purpose vector of the document"""
-    purposes = {
-        "transactional": any(word in text.lower() for word in ["payment", "invoice", "receipt", "transaction"]),
-        "informational": any(word in text.lower() for word in ["notice", "announcement", "information", "update"]),
-        "contractual": any(word in text.lower() for word in ["agreement", "contract", "terms", "conditions"]),
-        "correspondence": any(word in text.lower() for word in ["letter", "email", "message", "reply"])
-    }
-    return [k for k, v in purposes.items() if v]
+    """Determine the primary purpose of the document"""
+    try:
+        classifier = get_zero_shot_classifier()
+        candidate_labels = [
+            "meeting_notes", "contract", "correspondence", "report",
+            "proposal", "invoice", "policy", "presentation",
+            "agreement", "memo", "specification", "review"
+        ]
+        result = classifier(text, candidate_labels)
+        return {
+            "primary": result["labels"][0],
+            "confidence": result["scores"][0],
+            "secondary": result["labels"][1] if len(result["labels"]) > 1 else None
+        }
+    except Exception as e:
+        print(f"Error determining document purpose: {str(e)}")
+        return {"primary": "unknown", "confidence": 0.0, "secondary": None}
 
 def determine_activity_type(text):
     """Determine the type of activity represented in the document"""
@@ -1104,6 +1111,316 @@ def determine_temporal_markers(upload_date, text):
         pass
         
     return markers
+
+def extract_key_topics(text):
+    """Extract key topics using NLP and zero-shot classification"""
+    try:
+        nlp = get_nlp()
+        doc = nlp(text)
+        
+        # Extract noun phrases
+        key_phrases = [chunk.text for chunk in doc.noun_chunks 
+                      if len(chunk.text.split()) >= 2][:15]  # Limit to 15 topics
+        
+        # Get topics using zero-shot classification
+        classifier = get_zero_shot_classifier()
+        candidate_topics = [
+            "finance", "operations", "legal", "human_resources",
+            "technology", "sales", "marketing", "strategy",
+            "compliance", "research", "development", "customer_service"
+        ]
+        results = classifier(text, candidate_topics, multi_label=True)
+        
+        return {
+            "key_phrases": key_phrases,
+            "classified_topics": [
+                {"topic": label, "confidence": score}
+                for label, score in zip(results["labels"], results["scores"])
+                if score > 0.3
+            ]
+        }
+    except Exception as e:
+        print(f"Error extracting key topics: {str(e)}")
+        return {"key_phrases": [], "classified_topics": []}
+
+def extract_action_items(text):
+    """Extract action items and tasks from text"""
+    try:
+        action_patterns = [
+            r"(?i)(?:need to|must|should|will|to-do|action item[s]?:).*?(?:\.|$)",
+            r"(?i)(?:required|requested|pending|awaiting).*?(?:\.|$)",
+            r"(?i)(?:follow[- ]up|follow[- ]through).*?(?:\.|$)"
+        ]
+        
+        actions = []
+        for pattern in action_patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                action = match.group(0).strip()
+                if len(action) > 10:  # Filter out very short matches
+                    actions.append({
+                        "action": action,
+                        "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                    })
+        
+        return actions
+    except Exception as e:
+        print(f"Error extracting action items: {str(e)}")
+        return []
+
+def extract_dates(text, filter_type=None):
+    """Extract dates with context based on type"""
+    try:
+        nlp = get_nlp()
+        doc = nlp(text)
+        
+        date_patterns = {
+            "deadline": r"(?i)(?:due|deadline|by|until|before)\s*(?:the\s*)?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})",
+            "effective": r"(?i)(?:effective|valid|starts?|begins?)\s*(?:from|on)?\s*(?:the\s*)?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})",
+            "expiration": r"(?i)(?:expires?|valid until|ends?|terminates?)\s*(?:on)?\s*(?:the\s*)?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})",
+            "review": r"(?i)(?:review|assess|evaluate)\s*(?:on|by)?\s*(?:the\s*)?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4})"
+        }
+        
+        dates = []
+        if filter_type and filter_type in date_patterns:
+            matches = re.finditer(date_patterns[filter_type], text)
+            for match in matches:
+                dates.append({
+                    "date": match.group(1),
+                    "type": filter_type,
+                    "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                })
+        else:
+            # Extract all date entities
+            for ent in doc.ents:
+                if ent.label_ == "DATE":
+                    dates.append({
+                        "date": ent.text,
+                        "type": "general",
+                        "context": text[max(0, ent.start_char-50):min(len(text), ent.end_char+50)]
+                    })
+        
+        return dates
+    except Exception as e:
+        print(f"Error extracting dates: {str(e)}")
+        return []
+
+def extract_document_references(text, ref_type="related"):
+    """Extract references to other documents"""
+    try:
+        reference_patterns = {
+            "previous": r"(?i)(?:previous|prior|earlier|preceding)\s+(?:document|agreement|contract|version|revision)\s+(?:number|#|ref)?[\s:]*([\w-]+)",
+            "related": r"(?i)(?:related|associated|linked|referenced)\s+(?:document|agreement|contract)\s+(?:number|#|ref)?[\s:]*([\w-]+)",
+            "supersedes": r"(?i)(?:supersedes|replaces|updates)\s+(?:document|agreement|contract)\s+(?:number|#|ref)?[\s:]*([\w-]+)",
+            "child": r"(?i)(?:attachment|appendix|exhibit|annex)\s+(?:[A-Z]|[0-9]+|#)*[\s:]*([\w-]+)"
+        }
+        
+        if ref_type not in reference_patterns:
+            return []
+            
+        references = []
+        matches = re.finditer(reference_patterns[ref_type], text)
+        for match in matches:
+            references.append({
+                "reference_id": match.group(1),
+                "type": ref_type,
+                "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+            })
+            
+        return references
+    except Exception as e:
+        print(f"Error extracting document references: {str(e)}")
+        return []
+
+def generate_semantic_markers(text):
+    """Generate semantic markers for improved retrieval"""
+    try:
+        # Get key phrases using NLP
+        nlp = get_nlp()
+        doc = nlp(text)
+        
+        # Extract important phrases
+        phrases = [chunk.text for chunk in doc.noun_chunks 
+                  if len(chunk.text.split()) >= 2][:10]
+        
+        # Generate markers
+        markers = {
+            "key_phrases": phrases,
+            "document_length": len(text),
+            "complexity_score": calculate_complexity(text),
+            "formality_level": determine_formality(text),
+            "sentiment": analyze_sentiment(text)
+        }
+        
+        return markers
+    except Exception as e:
+        print(f"Error generating semantic markers: {str(e)}")
+        return {}
+
+def determine_confidentiality(text):
+    """Determine document confidentiality level"""
+    try:
+        confidential_patterns = {
+            "restricted": r"(?i)(restricted|confidential|private|sensitive)",
+            "internal": r"(?i)(internal use|internal only|company use|not for distribution)",
+            "public": r"(?i)(public|unclassified|unrestricted)"
+        }
+        
+        levels = {}
+        for level, pattern in confidential_patterns.items():
+            matches = re.finditer(pattern, text)
+            contexts = []
+            for match in matches:
+                contexts.append(text[max(0, match.start()-50):min(len(text), match.end()+50)])
+            if contexts:
+                levels[level] = contexts
+        
+        if not levels:
+            return {"level": "unspecified", "confidence": 0.0}
+            
+        # Return highest restriction level found
+        if "restricted" in levels:
+            return {"level": "restricted", "confidence": 1.0, "contexts": levels["restricted"]}
+        elif "internal" in levels:
+            return {"level": "internal", "confidence": 0.8, "contexts": levels["internal"]}
+        else:
+            return {"level": "public", "confidence": 0.6, "contexts": levels.get("public", [])}
+            
+    except Exception as e:
+        print(f"Error determining confidentiality: {str(e)}")
+        return {"level": "unspecified", "confidence": 0.0}
+
+def extract_business_unit(text):
+    """Extract business unit references"""
+    try:
+        # Common business unit patterns
+        unit_patterns = [
+            r"(?i)(?:department|dept|division|unit|team)[\s:]+([A-Za-z\s&]+?)(?:\.|,|\n|$)",
+            r"(?i)(?:from|to)[\s:]+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\s+(?:department|dept|division|unit|team)"
+        ]
+        
+        units = []
+        for pattern in unit_patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                unit = match.group(1).strip()
+                if len(unit) > 2:  # Filter out very short matches
+                    units.append({
+                        "unit": unit,
+                        "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                    })
+        
+        return units
+    except Exception as e:
+        print(f"Error extracting business unit: {str(e)}")
+        return []
+
+def extract_cost_center(text):
+    """Extract cost center information"""
+    try:
+        # Cost center patterns
+        patterns = [
+            r"(?i)cost\s+center[\s#:]+([A-Z0-9-]+)",
+            r"(?i)cc[\s#:]+([A-Z0-9-]+)",
+            r"(?i)center\s+code[\s#:]+([A-Z0-9-]+)"
+        ]
+        
+        centers = []
+        for pattern in patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                centers.append({
+                    "code": match.group(1),
+                    "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                })
+        
+        return centers
+    except Exception as e:
+        print(f"Error extracting cost center: {str(e)}")
+        return []
+
+def identify_compliance_items(text):
+    """Identify compliance-related items"""
+    try:
+        compliance_patterns = {
+            "regulatory": r"(?i)(regulation|compliance|regulatory|requirement)s?",
+            "legal": r"(?i)(law|statute|legal|legislation)",
+            "policy": r"(?i)(policy|procedure|guideline|standard)",
+            "certification": r"(?i)(certification|certified|accredited|iso)"
+        }
+        
+        items = {}
+        for category, pattern in compliance_patterns.items():
+            matches = re.finditer(pattern, text)
+            contexts = []
+            for match in matches:
+                contexts.append({
+                    "text": match.group(0),
+                    "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                })
+            if contexts:
+                items[category] = contexts
+        
+        return items
+    except Exception as e:
+        print(f"Error identifying compliance items: {str(e)}")
+        return {}
+
+def extract_timeline_markers(text):
+    """Extract timeline markers and milestones"""
+    try:
+        timeline_patterns = {
+            "milestone": r"(?i)milestone[\s#:]+([^\n.]+)",
+            "phase": r"(?i)phase[\s#:]+([^\n.]+)",
+            "stage": r"(?i)stage[\s#:]+([^\n.]+)",
+            "deadline": r"(?i)deadline[\s:]+([^\n.]+)"
+        }
+        
+        markers = {}
+        for marker_type, pattern in timeline_patterns.items():
+            matches = re.finditer(pattern, text)
+            items = []
+            for match in matches:
+                items.append({
+                    "text": match.group(1).strip(),
+                    "context": text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                })
+            if items:
+                markers[marker_type] = items
+        
+        return markers
+    except Exception as e:
+        print(f"Error extracting timeline markers: {str(e)}")
+        return {}
+
+def calculate_complexity(text):
+    """Calculate document complexity score"""
+    try:
+        # Simple complexity metrics
+        words = text.split()
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
+        
+        metrics = {
+            "word_count": len(words),
+            "sentence_count": len(sentences),
+            "avg_word_length": sum(len(w) for w in words) / len(words) if words else 0,
+            "avg_sentence_length": len(words) / len(sentences) if sentences else 0
+        }
+        
+        # Calculate complexity score (0-1)
+        complexity = min(1.0, (
+            (metrics["avg_word_length"] / 10) * 0.3 +
+            (min(metrics["avg_sentence_length"], 40) / 40) * 0.3 +
+            (min(metrics["word_count"], 1000) / 1000) * 0.4
+        ))
+        
+        return {
+            "score": complexity,
+            "metrics": metrics
+        }
+    except Exception as e:
+        print(f"Error calculating complexity: {str(e)}")
+        return {"score": 0.0, "metrics": {}}
 
 def main():
     global should_continue

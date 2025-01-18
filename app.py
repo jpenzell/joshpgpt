@@ -1268,6 +1268,9 @@ def process_documents():
         st.title("Document Processing")
         st.write("Processing documents from Shoeboxed and updating the knowledge base.")
         
+        # Initialize checkpoint for tracking processing state
+        checkpoint = ProcessingCheckpoint()
+        
         # Set up UI elements for progress tracking
         progress_container = st.container()
         with progress_container:
@@ -1290,7 +1293,6 @@ def process_documents():
             st.session_state.processor = DocumentProcessor()
         
         # Get initial counts from checkpoint
-        checkpoint = st.session_state.processor.checkpoint
         processed_count = len(checkpoint.processed_docs)
         failed_count = len(checkpoint.failed_docs)
         skipped_count = len(checkpoint.skipped_docs)
@@ -1347,7 +1349,7 @@ def process_documents():
                 
             if st.session_state.paused:
                 status_text.text("⏸️ Processing paused... Click Resume to continue")
-                time.sleep(0.5)  # Short sleep to prevent CPU spinning
+                time.sleep(1)  # Increased sleep time to reduce CPU usage
                 continue
                 
             # Refresh token at the start of each batch
@@ -2113,17 +2115,15 @@ def reset_processing_state():
 
 def main():
     """Main application function"""
-    # Initialize session state for interface mode
-    if 'current_interface' not in st.session_state:
-        st.session_state.current_interface = 'processor'
-    
-    # Initialize other session states
+    # Initialize session state variables if they don't exist
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
     if 'processing_active' not in st.session_state:
         st.session_state.processing_active = False
     if 'paused' not in st.session_state:
         st.session_state.paused = False
+    if 'current_interface' not in st.session_state:
+        st.session_state.current_interface = 'processor'
     
     # Sidebar
     st.sidebar.title("Controls")
@@ -2149,16 +2149,16 @@ def main():
             # Clean up any existing processor
             if hasattr(st.session_state, 'processor'):
                 delattr(st.session_state, 'processor')
-            st.session_state.paused = False
             st.session_state.processing_active = True
+            st.session_state.paused = False
             st.session_state.processor = DocumentProcessor()
             st.session_state.processor.checkpoint = checkpoint
             process_documents()
-        
+            
         # Pause/Resume button
-        pause_button_label = "⏸️ Pause" if not st.session_state.get('paused', False) else "▶️ Resume"
+        pause_button_label = "⏸️ Pause" if not st.session_state.paused else "▶️ Resume"
         if col2.button(pause_button_label):
-            st.session_state.paused = not st.session_state.get('paused', False)
+            st.session_state.paused = not st.session_state.paused
             if st.session_state.paused:
                 st.sidebar.warning("Processing paused")
             else:
@@ -2176,6 +2176,7 @@ def main():
                 # Stop any running processor
                 if hasattr(st.session_state, 'processor'):
                     st.session_state.processor.stop_event.set()
+                    delattr(st.session_state, 'processor')
                 
                 # Call the reset function
                 if reset_processing_state():
@@ -2732,17 +2733,27 @@ class DocumentProcessor:
             'total_failed': 0,
             'batch_failed': 0,
             'total_time': 0,
-            'batch_time': 0
+            'batch_time': 0,
+            'pause_time': 0
         }
-    
+        
     def process_document_worker(self):
         """Worker thread for processing documents"""
+        last_pause_time = None
+        
         while not self.stop_event.is_set():
             try:
                 # Check for pause state
                 if st.session_state.get('paused', False):
-                    time.sleep(0.5)  # Short sleep to prevent CPU spinning
+                    if last_pause_time is None:
+                        last_pause_time = time.time()
+                    time.sleep(1)  # Reduced CPU usage during pause
                     continue
+                else:
+                    if last_pause_time is not None:
+                        with self.lock:
+                            self.metrics['pause_time'] += time.time() - last_pause_time
+                        last_pause_time = None
                 
                 try:
                     doc = self.processing_queue.get_nowait()
@@ -2762,12 +2773,6 @@ class DocumentProcessor:
                     success = process_single_document(doc, current_tokens, self.checkpoint)
                     processing_time = time.time() - start_time
                     
-                    result = ProcessingResult(
-                        doc_id=doc['id'],
-                        success=success,
-                        processing_time=processing_time
-                    )
-                    
                     with self.lock:
                         if success:
                             self.metrics['batch_processed'] += 1
@@ -2778,22 +2783,29 @@ class DocumentProcessor:
                         self.metrics['batch_time'] += processing_time
                         self.metrics['total_time'] += processing_time
                     
+                    self.results_queue.put(ProcessingResult(
+                        doc_id=doc['id'],
+                        success=success,
+                        processing_time=processing_time
+                    ))
+                    
                 except Exception as e:
-                    print(f"❌ Error processing document {doc.get('id', 'Unknown')}: {str(e)}")
-                    result = ProcessingResult(
-                        doc_id=doc.get('id', 'Unknown'),
-                        success=False,
-                        processing_time=time.time() - start_time,
-                        error=str(e)
-                    )
+                    error_msg = f"Error processing document {doc.get('id', 'Unknown')}: {str(e)}"
+                    print(f"❌ {error_msg}")
                     
                     with self.lock:
                         self.metrics['batch_failed'] += 1
                         self.metrics['total_failed'] += 1
                         self.metrics['batch_time'] += time.time() - start_time
                         self.metrics['total_time'] += time.time() - start_time
+                    
+                    self.results_queue.put(ProcessingResult(
+                        doc_id=doc.get('id', 'Unknown'),
+                        success=False,
+                        processing_time=time.time() - start_time,
+                        error=str(e)
+                    ))
                 
-                self.results_queue.put(result)
                 time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
                 
             except Exception as e:
