@@ -31,6 +31,7 @@ from transformers import pipeline
 import textwrap
 import re
 import math
+from embedding_utils import EmbeddingManager
 
 # Load environment variables
 load_dotenv()
@@ -69,6 +70,9 @@ if os.path.exists(EMBEDDING_CACHE_FILE):
 _nlp = None
 _zero_shot_classifier = None
 _summarizer = None
+
+# Initialize embedding manager
+embedding_manager = EmbeddingManager()
 
 def get_nlp():
     global _nlp
@@ -316,20 +320,18 @@ def retry_with_backoff(func, max_retries=3, initial_delay=1):
     return wrapper
 
 def create_embedding(text, chunk_size=1000, overlap=100):
-    """Create embeddings with smart chunking and dimension handling"""
+    """Create embeddings with enhanced quality control and versioning"""
     try:
         # Clean and normalize text
         text = text.replace('\n', ' ').strip()
         
-        # Smart chunking for long texts
+        # Process chunks if text is too long
         if len(text) > chunk_size:
             chunks = []
             start = 0
             while start < len(text):
-                # Find the end of the current chunk
                 end = start + chunk_size
                 if end < len(text):
-                    # Try to end at a sentence boundary
                     next_period = text.find('.', end - 50, end + 50)
                     if next_period != -1:
                         end = next_period + 1
@@ -337,49 +339,67 @@ def create_embedding(text, chunk_size=1000, overlap=100):
                 chunk = text[start:end].strip()
                 if chunk:
                     chunks.append(chunk)
-                start = end - overlap  # Create overlap between chunks
+                start = end - overlap
         else:
             chunks = [text]
         
-        # Create embeddings for each chunk
+        # Create embeddings for each chunk with quality control
         embeddings = []
+        chunk_weights = []
+        
         for chunk in chunks:
-            for attempt in range(MAX_RETRIES):
-                try:
-                    response = client.embeddings.create(
-                        model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
-                        input=chunk,
-                        dimensions=EMBEDDING_DIMENSIONS
-                    )
-                    chunk_embedding = response.data[0].embedding
-                    embeddings.append(chunk_embedding)
-                    break
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        raise e
-                    time.sleep(2 ** attempt)  # Exponential backoff
+            content_hash = embedding_manager.compute_content_hash(chunk)
+            model_name = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
+            
+            # Check if we need to recompute the embedding
+            if embedding_manager.should_recompute_embedding(
+                content_hash, 
+                model_name, 
+                "1.0"  # Current version
+            ):
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        response = client.embeddings.create(
+                            model=model_name,
+                            input=chunk,
+                            dimensions=EMBEDDING_DIMENSIONS
+                        )
+                        
+                        chunk_embedding = response.data[0].embedding
+                        
+                        # Validate embedding quality
+                        is_valid, quality_metrics = embedding_manager.validate_embedding_quality(chunk_embedding)
+                        
+                        if not is_valid:
+                            print(f"Warning: Low quality embedding detected: {quality_metrics}")
+                            if attempt < MAX_RETRIES - 1:
+                                continue
+                        
+                        # Create and store metadata
+                        metadata = embedding_manager.create_embedding_metadata(
+                            content=chunk,
+                            model_name=model_name,
+                            dimensions=EMBEDDING_DIMENSIONS,
+                            content_type="text",
+                            processing_params={"chunk_size": chunk_size, "overlap": overlap},
+                            quality_metrics=quality_metrics
+                        )
+                        
+                        embeddings.append(chunk_embedding)
+                        chunk_weights.append(len(chunk))
+                        break
+                        
+                    except Exception as e:
+                        if attempt == MAX_RETRIES - 1:
+                            raise e
+                        time.sleep(2 ** attempt)
         
         if not embeddings:
             return None
         
-        # If we have multiple chunks, combine them
+        # Combine multiple chunks if necessary
         if len(embeddings) > 1:
-            # Average the embeddings (weighted by chunk lengths)
-            weights = [len(chunk) for chunk in chunks]
-            total_weight = sum(weights)
-            weights = [w/total_weight for w in weights]
-            
-            combined_embedding = []
-            for i in range(len(embeddings[0])):
-                value = sum(emb[i] * weight for emb, weight in zip(embeddings, weights))
-                combined_embedding.append(value)
-            
-            # Normalize the combined embedding
-            magnitude = math.sqrt(sum(x*x for x in combined_embedding))
-            if magnitude > 0:
-                combined_embedding = [x/magnitude for x in combined_embedding]
-            
-            return combined_embedding
+            return embedding_manager.combine_embeddings(embeddings, weights=chunk_weights)
         
         return embeddings[0]
     

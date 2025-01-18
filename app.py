@@ -27,6 +27,7 @@ from PIL import Image
 import queue
 import concurrent.futures
 import re
+from processing_metrics import ProcessingMetrics
 
 # Load environment variables
 load_dotenv()
@@ -2726,34 +2727,19 @@ class DocumentProcessor:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.checkpoint = ProcessingCheckpoint()
-        self.metrics = {
-            'total_documents': 0,
-            'total_processed': 0,
-            'batch_processed': 0,
-            'total_failed': 0,
-            'batch_failed': 0,
-            'total_time': 0,
-            'batch_time': 0,
-            'pause_time': 0
-        }
+        self.metrics = ProcessingMetrics()
         
     def process_document_worker(self):
         """Worker thread for processing documents"""
-        last_pause_time = None
-        
         while not self.stop_event.is_set():
             try:
                 # Check for pause state
                 if st.session_state.get('paused', False):
-                    if last_pause_time is None:
-                        last_pause_time = time.time()
-                    time.sleep(1)  # Reduced CPU usage during pause
+                    self.metrics.pause()
+                    time.sleep(1)
                     continue
                 else:
-                    if last_pause_time is not None:
-                        with self.lock:
-                            self.metrics['pause_time'] += time.time() - last_pause_time
-                        last_pause_time = None
+                    self.metrics.resume()
                 
                 try:
                     doc = self.processing_queue.get_nowait()
@@ -2775,29 +2761,24 @@ class DocumentProcessor:
                     
                     with self.lock:
                         if success:
-                            self.metrics['batch_processed'] += 1
-                            self.metrics['total_processed'] += 1
+                            self.metrics.processed_count += 1
                         else:
-                            self.metrics['batch_failed'] += 1
-                            self.metrics['total_failed'] += 1
-                        self.metrics['batch_time'] += processing_time
-                        self.metrics['total_time'] += processing_time
+                            self.metrics.failed_count += 1
+                        self.metrics.add_processing_time(processing_time)
                     
                     self.results_queue.put(ProcessingResult(
                         doc_id=doc['id'],
                         success=success,
                         processing_time=processing_time
                     ))
-                    
+                
                 except Exception as e:
                     error_msg = f"Error processing document {doc.get('id', 'Unknown')}: {str(e)}"
                     print(f"❌ {error_msg}")
                     
                     with self.lock:
-                        self.metrics['batch_failed'] += 1
-                        self.metrics['total_failed'] += 1
-                        self.metrics['batch_time'] += time.time() - start_time
-                        self.metrics['total_time'] += time.time() - start_time
+                        self.metrics.failed_count += 1
+                        self.metrics.add_processing_time(time.time() - start_time)
                     
                     self.results_queue.put(ProcessingResult(
                         doc_id=doc.get('id', 'Unknown'),
@@ -2806,7 +2787,7 @@ class DocumentProcessor:
                         error=str(e)
                     ))
                 
-                time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
+                time.sleep(RATE_LIMIT_DELAY)
                 
             except Exception as e:
                 print(f"Error in worker thread: {str(e)}")
@@ -2816,16 +2797,13 @@ class DocumentProcessor:
     def process_batch(self, documents, progress_bar, status_text, metrics_cols, processing_details, recent_files):
         """Process a batch of documents with real-time progress updates"""
         try:
-            # Reset batch metrics
-            self.metrics['batch_processed'] = 0
-            self.metrics['batch_failed'] = 0
-            self.metrics['batch_time'] = 0
+            batch_start_time = time.time()
             
             # Initialize processing queue if empty
             if self.processing_queue.empty():
                 for doc in documents:
                     self.processing_queue.put(doc)
-                self.metrics['total_documents'] = len(self.checkpoint.processed_docs) + len(documents)
+                self.metrics.total_documents = len(self.checkpoint.processed_docs) + len(documents)
             
             # Create and start worker threads
             num_threads = min(MAX_THREADS, len(documents))
@@ -2835,39 +2813,26 @@ class DocumentProcessor:
                     futures.append(executor.submit(self.process_document_worker))
                 
                 # Monitor progress while threads are running
-                start_time = time.time()
                 while any(not f.done() for f in futures):
                     try:
                         # Process results and update UI
                         self._process_results(progress_bar, status_text, metrics_cols, processing_details)
                         
-                        # Update status message based on pause state
-                        is_paused = st.session_state.get('paused', False)
+                        # Get current progress stats
+                        stats = self.metrics.get_progress_stats()
+                        completion_estimate = stats["estimated_completion"]
                         
-                        if is_paused:
+                        # Update status message
+                        if st.session_state.get('paused', False):
                             status_text.text("⏸️ Processing paused... Click Resume to continue")
                         else:
-                            total_processed = self.metrics['total_processed'] + self.metrics['total_failed']
-                            total_remaining = self.metrics['total_documents'] - total_processed
-                            
-                            if total_processed > 0:
-                                progress = total_processed / self.metrics['total_documents']
-                                elapsed_time = time.time() - start_time
-                                avg_time_per_doc = elapsed_time / total_processed
-                                est_time_remaining = total_remaining * avg_time_per_doc
-                                
-                                # Format estimated time remaining
-                                if est_time_remaining > 3600:
-                                    time_str = f"{est_time_remaining/3600:.1f} hours"
-                                elif est_time_remaining > 60:
-                                    time_str = f"{est_time_remaining/60:.1f} minutes"
-                                else:
-                                    time_str = f"{est_time_remaining:.0f} seconds"
-                                
-                                rate = total_processed / elapsed_time
-                                status_text.text(f"🔄 Progress: {progress:.1%} | Rate: {rate:.1f} docs/sec | Est. remaining: {time_str}")
-                            else:
-                                status_text.text("🔄 Starting processing...")
+                            rate = stats["processing_rate"]["docs_per_minute"]
+                            status_text.text(
+                                f"🔄 Progress: {stats['progress_percentage']:.1f}% | "
+                                f"Rate: {rate:.1f} docs/min | "
+                                f"Est. remaining: {completion_estimate['time_remaining']} "
+                                f"(Accuracy: {completion_estimate['accuracy']})"
+                            )
                         
                         time.sleep(0.1)
                     except Exception as e:
@@ -2879,6 +2844,9 @@ class DocumentProcessor:
                 
                 # Wait for all workers to complete
                 concurrent.futures.wait(futures)
+                
+                # Record batch processing time
+                self.metrics.add_batch_time(time.time() - batch_start_time)
                 
         except Exception as e:
             print(f"Error in process_batch: {str(e)}")
@@ -2893,34 +2861,40 @@ class DocumentProcessor:
                 except queue.Empty:
                     break
                 
+                # Get current progress stats
+                stats = self.metrics.get_progress_stats()
+                
                 # Update progress bar
-                total_processed = self.metrics['total_processed'] + self.metrics['total_failed']
-                if self.metrics['total_documents'] > 0:
-                    progress = total_processed / self.metrics['total_documents']
-                    progress_bar.progress(progress)
+                progress_bar.progress(stats["progress_percentage"] / 100)
                 
                 # Update metrics
                 metrics_cols[0].metric(
                     "Total Documents",
-                    f"{self.metrics['total_documents']:,}",
-                    f"{self.metrics['total_documents'] - total_processed:,} remaining"
+                    f"{stats['total_documents']:,}",
+                    f"{stats['remaining']:,} remaining"
                 )
                 metrics_cols[1].metric(
                     "Processed",
-                    f"{self.metrics['total_processed']:,}",
-                    f"+{self.metrics['batch_processed']}" if self.metrics['batch_processed'] > 0 else None
+                    f"{stats['processed']:,}",
+                    f"+{stats['processed'] - self.checkpoint.processed_count}" if stats['processed'] > self.checkpoint.processed_count else None
                 )
                 metrics_cols[2].metric(
                     "Failed",
-                    f"{self.metrics['total_failed']:,}",
-                    f"+{self.metrics['batch_failed']}" if self.metrics['batch_failed'] > 0 else None
+                    f"{stats['failed']:,}",
+                    f"+{stats['failed'] - len(self.checkpoint.failed_docs)}" if stats['failed'] > len(self.checkpoint.failed_docs) else None
                 )
                 
                 # Log processing details
                 if result.success:
-                    processing_details.info(f"✅ Processed document {result.doc_id} ({result.processing_time:.1f}s)")
+                    processing_details.info(
+                        f"✅ Processed document {result.doc_id} ({result.processing_time:.1f}s) | "
+                        f"Rate: {stats['processing_rate']['docs_per_minute']:.1f} docs/min"
+                    )
                 else:
-                    processing_details.error(f"❌ Failed document {result.doc_id}: {result.error}")
+                    processing_details.error(
+                        f"❌ Failed document {result.doc_id}: {result.error} "
+                        f"({result.processing_time:.1f}s)"
+                    )
                 
         except Exception as e:
             print(f"Error processing results: {str(e)}")

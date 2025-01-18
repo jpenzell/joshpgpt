@@ -6,6 +6,9 @@ import textwrap
 import time
 from pinecone import Pinecone
 from dotenv import load_dotenv
+from embedding_utils import EmbeddingManager
+from typing import List, Dict, Optional, Union
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -15,6 +18,9 @@ client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Get embedding dimensions from environment
 EMBEDDING_DIMENSIONS = int(os.getenv('OPENAI_EMBEDDING_DIMENSIONS', '1536'))
+
+# Initialize embedding manager
+embedding_manager = EmbeddingManager()
 
 def init_pinecone():
     """Initialize Pinecone connection"""
@@ -31,28 +37,40 @@ def init_pinecone():
         print(f"Error initializing Pinecone: {str(e)}")
         return None
 
-def create_embedding(text):
-    """Create embedding with retry logic and dimension verification"""
+def create_embedding(text: str) -> Optional[List[float]]:
+    """Create embedding with enhanced quality control"""
     max_retries = int(os.getenv('MAX_RETRIES', '3'))
     
     for attempt in range(max_retries):
         try:
             print(f"Creating embedding (attempt {attempt + 1}/{max_retries})")
+            
+            # Generate embedding
             response = client.embeddings.create(
-                model=os.getenv('OPENAI_EMBEDDING_MODEL'),
+                model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
                 input=text,
                 dimensions=EMBEDDING_DIMENSIONS
             )
             
             embedding = response.data[0].embedding
             
-            # Verify embedding dimension
-            if len(embedding) != EMBEDDING_DIMENSIONS:
-                print(f"Warning: Unexpected embedding dimension {len(embedding)}, expected {EMBEDDING_DIMENSIONS}")
+            # Validate quality
+            is_valid, quality_metrics = embedding_manager.validate_embedding_quality(embedding)
+            if not is_valid:
+                print(f"Warning: Low quality embedding detected: {quality_metrics}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                     continue
-                return None
+            
+            # Create metadata
+            metadata = embedding_manager.create_embedding_metadata(
+                content=text,
+                model_name=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
+                dimensions=EMBEDDING_DIMENSIONS,
+                content_type="query",
+                processing_params={},
+                quality_metrics=quality_metrics
+            )
             
             return embedding
             
@@ -63,48 +81,116 @@ def create_embedding(text):
             else:
                 return None
 
-def search_documents(query, index, n=5):
-    """Search for relevant documents"""
-    query_embedding = create_embedding(query)
-    results = index.query(
-        vector=query_embedding,
-        top_k=n,
-        include_metadata=True
-    )
-    return results.matches
-
-def format_document_context(documents):
-    """Format retrieved documents into context for the AI"""
-    context = []
-    for doc in documents:
-        metadata = doc.metadata
-        score = doc.score if hasattr(doc, 'score') else 'N/A'
+def semantic_search(
+    query: str,
+    index,
+    top_k: int = 5,
+    threshold: float = 0.7,
+    search_type: str = "similarity"
+) -> List[Dict]:
+    """Enhanced semantic search with multiple search strategies"""
+    try:
+        # Create query embedding
+        query_embedding = create_embedding(query)
+        if not query_embedding:
+            return []
         
-        # Create a more structured context
-        doc_info = {
-            'relevance': score,
-            'id': metadata.get('id', 'Unknown'),
-            'category': metadata.get('category', 'Unknown'),
-            'date': metadata.get('created', 'Unknown'),
-            'total': metadata.get('total', 'N/A'),
-            'tax': metadata.get('tax', 'N/A'),
-            'text': metadata.get('text', 'No text available'),
-            'processed_date': metadata.get('processed_date', 'Unknown')
+        # Normalize the query embedding
+        query_embedding = embedding_manager.normalize_embedding(query_embedding)
+        
+        # Prepare search parameters based on search type
+        search_params = {
+            "top_k": top_k,
+            "include_metadata": True
         }
         
-        # Format the document information
-        context.append(
-            f"Document (ID: {doc_info['id']}, Relevance: {doc_info['relevance']:.2f}):\n"
-            f"Category: {doc_info['category']}\n"
-            f"Date: {doc_info['date']}\n"
-            f"Amount: ${doc_info['total']}\n"
-            f"Tax: ${doc_info['tax']}\n"
-            f"Processed: {doc_info['processed_date']}\n"
-            f"Content: {doc_info['text']}\n"
-            f"---"
+        if search_type == "similarity":
+            # Standard similarity search
+            results = index.query(
+                vector=query_embedding,
+                **search_params
+            )
+        elif search_type == "hybrid":
+            # Hybrid search combining semantic and keyword matching
+            results = index.query(
+                vector=query_embedding,
+                filter={
+                    "text_match": {"$contains": query.lower()}
+                },
+                **search_params
+            )
+        elif search_type == "mmr":
+            # Maximum Marginal Relevance search for diversity
+            results = index.query(
+                vector=query_embedding,
+                sparse_vector=query.split(),  # Simple keyword representation
+                **search_params
+            )
+        else:
+            raise ValueError(f"Unknown search type: {search_type}")
+        
+        # Filter results by similarity threshold
+        filtered_results = []
+        for match in results.matches:
+            if match.score >= threshold:
+                filtered_results.append({
+                    "id": match.id,
+                    "score": match.score,
+                    "metadata": match.metadata
+                })
+        
+        return filtered_results
+        
+    except Exception as e:
+        print(f"Error in semantic search: {str(e)}")
+        return []
+
+def get_context_window(
+    query: str,
+    index,
+    max_tokens: int = 3000,
+    search_type: str = "similarity"
+) -> str:
+    """Get context window with enhanced search capabilities"""
+    try:
+        # Perform semantic search
+        results = semantic_search(
+            query=query,
+            index=index,
+            top_k=5,
+            threshold=0.7,
+            search_type=search_type
         )
-    
-    return "\n".join(context)
+        
+        if not results:
+            return "No relevant context found."
+        
+        # Build context window with metadata
+        context_parts = []
+        total_tokens = 0
+        
+        for result in results:
+            # Extract text and metadata
+            text = result["metadata"].get("text", "")
+            source = result["metadata"].get("source", "Unknown")
+            date = result["metadata"].get("date", "Unknown")
+            score = result["score"]
+            
+            # Format context entry
+            entry = f"\nSource: {source}\nDate: {date}\nRelevance: {score:.2f}\nContent:\n{text}\n"
+            entry_tokens = len(entry.split())  # Simple token estimation
+            
+            if total_tokens + entry_tokens > max_tokens:
+                break
+                
+            context_parts.append(entry)
+            total_tokens += entry_tokens
+        
+        return "\n---\n".join(context_parts)
+        
+    except Exception as e:
+        print(f"Error getting context window: {str(e)}")
+        return "Error retrieving context."
 
 def chat_with_documents(query):
     """Chat with documents using GPT-4o with enhanced context understanding"""
