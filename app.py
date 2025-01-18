@@ -2003,6 +2003,16 @@ def reset_processing_state():
     try:
         print("\n🧹 Starting cleanup process...")
         
+        # Reset session state variables first
+        for key in list(st.session_state.keys()):
+            if key != 'authenticated':  # Keep authentication state
+                del st.session_state[key]
+        
+        # Initialize clean state
+        st.session_state.processing_active = False
+        st.session_state.paused = False
+        st.session_state.current_interface = 'processor'
+        
         # Clear Pinecone index
         print("🔄 Clearing Pinecone index...")
         index = init_pinecone()
@@ -2016,24 +2026,33 @@ def reset_processing_state():
                 else:
                     print(f"⚠️ Error clearing Pinecone index: {str(e)}")
         
-        # Delete local files
+        # Delete all local state and cache files
         files_to_delete = [
             'processing_checkpoint.json',
             'document_id_cache.json',
-            'retrieval_metadata.json'  # Add new metadata file
+            'retrieval_metadata.json',
+            'processing_progress.json',
+            'embedding_cache.json',
+            '.auth_success',
+            'document_list_cache.json'
         ]
         
+        print("\n🗑️ Cleaning up local files...")
         for file in files_to_delete:
             if os.path.exists(file):
-                os.remove(file)
-                print(f"✅ Deleted {file}")
+                try:
+                    os.remove(file)
+                    print(f"✅ Deleted {file}")
+                except Exception as e:
+                    print(f"⚠️ Error deleting {file}: {str(e)}")
             else:
                 print(f"ℹ️ File not found: {file}")
         
-        # Clear document directories
+        # Clear all document directories
+        print("\n📁 Cleaning up directories...")
         found_dirs = False
         for dir_name in os.listdir('.'):
-            if dir_name.startswith('documents_'):
+            if dir_name.startswith('documents_') or dir_name == 'documents' or dir_name == 'cache':
                 found_dirs = True
                 try:
                     shutil.rmtree(dir_name)
@@ -2045,30 +2064,41 @@ def reset_processing_state():
             print("ℹ️ No document directories found to clean")
         
         # Clear S3 bucket
+        print("\n☁️ Cleaning up S3...")
         try:
-            s3_client = boto3.client('s3')
-            bucket_name = os.environ.get('S3_BUCKET_NAME', 'shoeboxed-documents')
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+            )
+            bucket_name = os.getenv('S3_BUCKET_NAME')
             
-            print(f"🔄 Clearing S3 bucket {bucket_name}/processed_documents/...")
-            
-            # List and delete all objects in the processed_documents prefix
-            paginator = s3_client.get_paginator('list_objects_v2')
-            objects_to_delete = []
-            
-            for page in paginator.paginate(Bucket=bucket_name, Prefix='processed_documents/'):
-                if 'Contents' in page:
-                    objects_to_delete.extend(
-                        {'Key': obj['Key']} for obj in page['Contents']
-                    )
-            
-            if objects_to_delete:
-                s3_client.delete_objects(
-                    Bucket=bucket_name,
-                    Delete={'Objects': objects_to_delete}
-                )
-                print(f"✅ Deleted {len(objects_to_delete)} objects from S3")
+            if bucket_name:
+                print(f"🔄 Clearing S3 bucket {bucket_name}...")
+                
+                # List and delete all objects in batches
+                paginator = s3_client.get_paginator('list_objects_v2')
+                total_objects = 0
+                
+                for page in paginator.paginate(Bucket=bucket_name):
+                    if 'Contents' in page:
+                        objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                        if objects:
+                            # Delete in batches of 1000 (S3 limit)
+                            for i in range(0, len(objects), 1000):
+                                batch = objects[i:i + 1000]
+                                s3_client.delete_objects(
+                                    Bucket=bucket_name,
+                                    Delete={'Objects': batch}
+                                )
+                                total_objects += len(batch)
+                
+                if total_objects > 0:
+                    print(f"✅ Deleted {total_objects} objects from S3")
+                else:
+                    print("ℹ️ No objects found in S3 to delete")
             else:
-                print("ℹ️ No objects found in S3 to delete")
+                print("ℹ️ S3 bucket name not configured")
                 
         except Exception as e:
             print(f"⚠️ Error clearing S3 bucket: {str(e)}")
@@ -2078,6 +2108,7 @@ def reset_processing_state():
         
     except Exception as e:
         print(f"❌ Error during reset: {str(e)}")
+        print(traceback.format_exc())
         return False
 
 def main():
@@ -2142,12 +2173,17 @@ def main():
         # Reset button - enabled when processing is paused or not active
         if col3.button("🔄 Reset"):
             try:
+                # Stop any running processor
                 if hasattr(st.session_state, 'processor'):
                     st.session_state.processor.stop_event.set()
-                    delattr(st.session_state, 'processor')
-                st.session_state.paused = False
-                st.session_state.processing_active = False
-                st.session_state.current_interface = 'processor'
+                
+                # Call the reset function
+                if reset_processing_state():
+                    st.success("Reset complete! The system is ready for fresh document processing.")
+                else:
+                    st.error("Error occurred during reset. Please try again.")
+                
+                # Force a rerun to refresh the UI
                 st.rerun()
             except Exception as e:
                 st.error(f"Error resetting processor: {str(e)}")
