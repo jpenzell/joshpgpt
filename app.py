@@ -2005,7 +2005,7 @@ def reset_processing_state():
         
         # Reset session state variables first
         for key in list(st.session_state.keys()):
-            if key != 'authenticated':  # Keep authentication state
+            if key not in ['authenticated']:  # Keep authentication state
                 del st.session_state[key]
         
         # Initialize clean state
@@ -2026,16 +2026,15 @@ def reset_processing_state():
                 else:
                     print(f"⚠️ Error clearing Pinecone index: {str(e)}")
         
-        # Delete all local state and cache files
+        # Delete all local state and cache files (except auth)
         files_to_delete = [
             'processing_checkpoint.json',
             'document_id_cache.json',
             'retrieval_metadata.json',
             'processing_progress.json',
             'embedding_cache.json',
-            '.auth_success',
             'document_list_cache.json'
-        ]
+        ]  # Removed .auth_success from this list
         
         print("\n🗑️ Cleaning up local files...")
         for file in files_to_delete:
@@ -2104,6 +2103,7 @@ def reset_processing_state():
             print(f"⚠️ Error clearing S3 bucket: {str(e)}")
         
         print("\n✅ Reset complete! The system is ready for fresh document processing.")
+        print("ℹ️ Shoeboxed authentication has been preserved.")
         return True
         
     except Exception as e:
