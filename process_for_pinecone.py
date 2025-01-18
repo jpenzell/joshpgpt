@@ -6,7 +6,6 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
 import fitz  # PyMuPDF
-import openai
 import time
 from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
@@ -27,6 +26,9 @@ from typing import List, Dict
 import numpy as np
 import multiprocessing
 import psutil
+import spacy
+from transformers import pipeline
+import textwrap
 
 # Load environment variables
 load_dotenv()
@@ -34,16 +36,16 @@ load_dotenv()
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
+# Constants from environment
+EMBEDDING_DIMENSIONS = int(os.getenv('OPENAI_EMBEDDING_DIMENSIONS', '1536'))
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', '4'))
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '20'))
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+MAX_MEMORY_PERCENT = int(os.getenv('MAX_MEMORY_PERCENT', '85'))
+
 # Dynamic resource allocation
 CPU_COUNT = multiprocessing.cpu_count()
-MEMORY_GB = psutil.virtual_memory().total / (1024 ** 3)  # Memory in GB
-
-# Optimized constants
-MAX_WORKERS = max(4, min(CPU_COUNT - 1, 8))  # Leave one core free, max 8 workers
-BATCH_SIZE = 20  # Increased from 10
-EMBEDDING_BATCH_SIZE = 50  # Increased from 20
-EMBEDDING_DIMENSIONS = 384  # Reduced from 1536 for better performance
-MAX_MEMORY_PERCENT = 75  # Maximum memory usage percentage
+MEMORY_GB = psutil.virtual_memory().total / (1024 ** 3)
 
 # Cache configuration
 CACHE_DIR = os.path.join(os.path.dirname(__file__), 'cache')
@@ -60,6 +62,46 @@ if os.path.exists(EMBEDDING_CACHE_FILE):
             embedding_cache = json.load(f)
     except Exception as e:
         print(f"Error loading embedding cache: {str(e)}")
+
+# Lazy loading of models
+_nlp = None
+_zero_shot_classifier = None
+_summarizer = None
+
+def get_nlp():
+    global _nlp
+    if _nlp is None:
+        try:
+            _nlp = spacy.load(os.getenv('SPACY_MODEL', 'en_core_web_lg'))
+        except Exception as e:
+            print(f"Error loading spaCy model: {str(e)}")
+            raise
+    return _nlp
+
+def get_zero_shot_classifier():
+    global _zero_shot_classifier
+    if _zero_shot_classifier is None:
+        try:
+            _zero_shot_classifier = pipeline("zero-shot-classification", 
+                                          model=os.getenv('ZERO_SHOT_MODEL', 'facebook/bart-large-mnli'))
+        except Exception as e:
+            print(f"Error loading zero-shot classifier: {str(e)}")
+            raise
+    return _zero_shot_classifier
+
+def get_summarizer():
+    global _summarizer
+    if _summarizer is None:
+        try:
+            _summarizer = pipeline("summarization", 
+                                 model=os.getenv('SUMMARIZATION_MODEL', 'facebook/bart-large-cnn'))
+        except Exception as e:
+            print(f"Error loading summarizer: {str(e)}")
+            raise
+    return _summarizer
+
+# Initialize should_continue flag
+should_continue = True
 
 def save_embedding_cache():
     """Save embedding cache to disk"""
@@ -271,73 +313,37 @@ def retry_with_backoff(func, max_retries=3, initial_delay=1):
     
     return wrapper
 
-@retry_with_backoff
-def create_embedding(text, max_tokens=8000):
-    """Create embedding for text, handling large texts by chunking"""
-    try:
-        # Initialize OpenAI client
-        client = OpenAI()
-        
-        # Split text into chunks if needed
-        import tiktoken
-        encoding = tiktoken.get_encoding("cl100k_base")
-        tokens = encoding.encode(text)
-        
-        if len(tokens) > max_tokens:
-            # Split into chunks and get embeddings for each chunk
-            chunk_embeddings = []
-            for i in range(0, len(tokens), max_tokens):
-                chunk_tokens = tokens[i:i + max_tokens]
-                chunk_text = encoding.decode(chunk_tokens)
-                
-                # Get embedding for chunk with retries
-                for attempt in range(3):
-                    try:
-                        response = client.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=chunk_text
-                        )
-                        chunk_embeddings.append(response.data[0].embedding)
-                        break
-                    except Exception as e:
-                        print(f"Error creating embedding: {str(e)}")
-                        if attempt < 2:
-                            print(f"Attempt {attempt + 1} failed: {str(e)}")
-                            print(f"Retrying in {2 ** attempt} seconds...")
-                            time.sleep(2 ** attempt)
-                        else:
-                            print(f"All {attempt + 1} attempts failed. Last error: {str(e)}")
-                            raise
+def create_embedding(text):
+    """Create embedding with retry logic"""
+    max_retries = int(os.getenv('MAX_RETRIES', '3'))
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Creating embedding (attempt {attempt + 1}/{max_retries})")
+            response = client.embeddings.create(
+                model=os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small'),
+                input=text,
+                dimensions=EMBEDDING_DIMENSIONS
+            )
             
-            # Average the embeddings from all chunks
-            import numpy as np
-            combined_embedding = np.mean(chunk_embeddings, axis=0)
-            # Normalize the combined embedding
-            combined_embedding = combined_embedding / np.linalg.norm(combined_embedding)
-            return combined_embedding.tolist()
-        
-        else:
-            # For texts within token limit, proceed normally
-            for attempt in range(3):
-                try:
-                    response = client.embeddings.create(
-                        model="text-embedding-3-small",
-                        input=text
-                    )
-                    return response.data[0].embedding
-                except Exception as e:
-                    print(f"Error creating embedding: {str(e)}")
-                    if attempt < 2:
-                        print(f"Attempt {attempt + 1} failed: {str(e)}")
-                        print(f"Retrying in {2 ** attempt} seconds...")
-                        time.sleep(2 ** attempt)
-                    else:
-                        print(f"All {attempt + 1} attempts failed. Last error: {str(e)}")
-                        raise
-                        
-    except Exception as e:
-        print(f"Error in create_embedding: {str(e)}")
-        return None
+            embedding = response.data[0].embedding
+            
+            # Verify embedding dimension
+            if len(embedding) != EMBEDDING_DIMENSIONS:
+                print(f"Warning: Unexpected embedding dimension {len(embedding)}, expected {EMBEDDING_DIMENSIONS}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"Error creating embedding: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return None
 
 @retry_with_backoff
 def extract_text_with_vision(image_base64):
@@ -503,6 +509,9 @@ class ProcessingState:
     def __init__(self):
         self.progress_file = 'processing_progress.json'
         self.processed_docs = set()
+        self.failed_docs = {}
+        self.skipped_docs = set()
+        self.status = 'initialized'
     
     def load_progress(self):
         """Load progress from file"""
@@ -511,6 +520,9 @@ class ProcessingState:
                 with open(self.progress_file, 'r') as f:
                     data = json.load(f)
                     self.processed_docs = set(data.get('processed_docs', []))
+                    self.failed_docs = data.get('failed_docs', {})
+                    self.skipped_docs = set(data.get('skipped_docs', []))
+                    self.status = data.get('status', 'initialized')
         except Exception as e:
             print(f"Error loading progress: {str(e)}")
     
@@ -519,7 +531,10 @@ class ProcessingState:
         try:
             with open(self.progress_file, 'w') as f:
                 json.dump({
-                    'processed_docs': list(self.processed_docs)
+                    'processed_docs': list(self.processed_docs),
+                    'failed_docs': self.failed_docs,
+                    'skipped_docs': list(self.skipped_docs),
+                    'status': self.status
                 }, f)
         except Exception as e:
             print(f"Error saving progress: {str(e)}")
@@ -527,18 +542,46 @@ class ProcessingState:
     def mark_processed(self, doc_id):
         """Mark document as processed"""
         self.processed_docs.add(doc_id)
+        if doc_id in self.failed_docs:
+            del self.failed_docs[doc_id]
+        self.save_progress()
+    
+    def mark_failed(self, doc_id, reason):
+        """Mark document as failed with reason"""
+        self.failed_docs[doc_id] = {
+            'reason': reason,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.save_progress()
+    
+    def mark_skipped(self, doc_id):
+        """Mark document as skipped"""
+        self.skipped_docs.add(doc_id)
+        self.save_progress()
     
     def is_processed(self, doc_id):
         """Check if document is already processed"""
         return doc_id in self.processed_docs
+    
+    def set_status(self, status):
+        """Set processing status"""
+        self.status = status
+        self.save_progress()
 
 def init_pinecone():
     """Initialize Pinecone with proper configuration"""
-    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-    return pc.Index(
-        name=os.getenv('PINECONE_INDEX_NAME'),
-        host=os.getenv('PINECONE_INDEX_HOST')
-    )
+    try:
+        pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+        index = pc.Index(
+            name=os.getenv('PINECONE_INDEX_NAME'),
+            host=os.getenv('PINECONE_INDEX_HOST')
+        )
+        # Test connection
+        index.describe_index_stats()
+        return index
+    except Exception as e:
+        print(f"Error initializing Pinecone: {str(e)}")
+        return None
 
 def upload_to_s3(file_content, doc_id, content_type):
     """Upload file to S3"""
@@ -566,6 +609,63 @@ def upload_to_s3(file_content, doc_id, content_type):
     except ClientError as e:
         print(f"Error uploading to S3: {str(e)}")
         return None
+
+def extract_enhanced_metadata(text, doc):
+    """Extract enhanced metadata from document text"""
+    try:
+        # Process with spaCy
+        nlp = get_nlp()
+        doc_nlp = nlp(text)
+        
+        # Extract entities
+        entities = {
+            'people': [ent.text for ent in doc_nlp.ents if ent.label_ == 'PERSON'],
+            'organizations': [ent.text for ent in doc_nlp.ents if ent.label_ == 'ORG'],
+            'locations': [ent.text for ent in doc_nlp.ents if ent.label_ == 'GPE'],
+            'dates': [ent.text for ent in doc_nlp.ents if ent.label_ == 'DATE']
+        }
+        
+        # Document classification
+        doc_types = ["essay", "note", "receipt", "tax_document", "correspondence", "medical_record"]
+        zero_shot_classifier = get_zero_shot_classifier()
+        classification = zero_shot_classifier(text, doc_types)
+        
+        # Generate summary if text is long enough
+        summary = ""
+        if len(text.split()) > 50:
+            summarizer = get_summarizer()
+            summary = summarizer(text, max_length=130, min_length=30, do_sample=False)[0]['summary_text']
+        
+        # Extract topics using basic keyword extraction
+        keywords = [token.text for token in doc_nlp if token.is_alpha and not token.is_stop]
+        topics = list(set([word.lower() for word in keywords]))[:10]
+        
+        return {
+            'entities': entities,
+            'doc_type': classification['labels'][0],
+            'doc_type_confidence': classification['scores'][0],
+            'summary': summary,
+            'topics': topics,
+            'source': doc.get('source', 'unknown'),
+            'processed_date': datetime.now().isoformat(),
+            'original_date': doc.get('created', 'unknown'),
+            'language': doc_nlp.lang_,
+            'word_count': len(text.split())
+        }
+    except Exception as e:
+        print(f"Error extracting enhanced metadata: {str(e)}")
+        return {
+            'entities': {},
+            'doc_type': 'unknown',
+            'doc_type_confidence': 0.0,
+            'summary': '',
+            'topics': [],
+            'source': doc.get('source', 'unknown'),
+            'processed_date': datetime.now().isoformat(),
+            'original_date': doc.get('created', 'unknown'),
+            'language': 'en',
+            'word_count': len(text.split())
+        }
 
 def process_single_document(doc, access_token, checkpoint):
     """Process a single document and upload to Pinecone"""

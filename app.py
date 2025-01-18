@@ -208,6 +208,8 @@ def init_pinecone():
             name=PINECONE_INDEX_NAME,
             host=PINECONE_INDEX_HOST
         )
+        # Test connection
+        index.describe_index_stats()
         return index
     except Exception as e:
         print(f"Error initializing Pinecone: {str(e)}")
