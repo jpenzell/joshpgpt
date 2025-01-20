@@ -631,163 +631,75 @@ def handle_auth():
         st.session_state.authenticated = False
 
 def retrieve_all_document_ids(tokens, checkpoint):
-    """
-    Retrieve document IDs with robust resumption and date-based filtering
-    
-    Args:
-        tokens (dict): Authentication tokens
-        checkpoint (ProcessingCheckpoint): Checkpoint system for tracking progress
-    """
-    # Create a Streamlit placeholder for the running count
-    running_count = st.empty()
-    total_to_process = 0
-    
-    print("\n📋 Document Processing Status:")
-    print("--------------------------------")
-    print(f"✅ Fully Processed (in Pinecone): {len(checkpoint.processed_docs)}")
-    print(f"❌ Failed Documents: {len(checkpoint.failed_docs)}")
-    print(f"⏭️ Skipped Documents: {len(checkpoint.skipped_docs)}")
-    
-    # Get account ID and prepare API endpoint
-    account_id = get_organization_id(tokens['access_token'])
-    list_url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
-    headers = get_shoeboxed_headers(tokens['access_token'])
-    
-    # Batch processing parameters
-    batch_size = 100  # Maximum allowed by API
-    all_document_ids = []
-    current_offset = 0
-    
+    """Retrieve all document IDs from Shoeboxed"""
     try:
-        # First get total count with minimal filtering
-        params = {
-            'offset': 0,
-            'limit': 1,
-            'include': 'attachment,stats,categories,type',
-            'trashed': 'false'
-        }
+        print("\n📋 Document Processing Status:")
+        print("--------------------------------")
+        print(f"✅ Fully Processed (in Pinecone): {len(checkpoint.processed_documents)}")
         
-        print("\n🔍 Checking total document count...")
-        print(f"Request URL: {list_url}")
-        print(f"Request params: {params}")
-        print(f"Request headers: {headers}")
-        
-        response = requests.get(list_url, headers=headers, params=params)
-        print(f"Response status: {response.status_code}")
-        print(f"Response headers: {dict(response.headers)}")
-        print(f"Response body: {response.text}")
-        
-        if response.status_code != 200:
-            print(f"❌ Failed to fetch document count. Status: {response.status_code}")
-            return []
+        # Get organization ID
+        account_id = get_organization_id(tokens['access_token'])
+        if not account_id:
+            raise Exception("Failed to get organization ID")
             
-        total_count = response.json().get('totalCount', 0)
-        print(f"\n📊 Total documents in Shoeboxed: {total_count}")
+        # Initialize variables for pagination
+        all_document_ids = []
+        offset = 0
+        limit = 100  # Number of documents per request
         
         while True:
-            # Prepare query parameters with minimal filtering
+            # Construct API URL with pagination parameters
+            url = f"https://api.shoeboxed.com/v2/accounts/{account_id}/documents"
             params = {
-                'offset': current_offset,
-                'limit': batch_size,
-                'include': 'attachment,stats,categories,type',
-                'trashed': 'false'
+                'limit': limit,
+                'offset': offset,
+                'include': 'attachments,categories,vendor'
             }
             
-            print(f"\n📡 Fetching document batch starting at offset {current_offset}")
-            print(f"Request params: {params}")
-            
-            response = requests.get(list_url, headers=headers, params=params)
-            print(f"Response status: {response.status_code}")
+            # Make API request
+            response = requests.get(
+                url,
+                params=params,
+                headers=get_shoeboxed_headers(tokens['access_token'])
+            )
             
             if response.status_code != 200:
-                print(f"❌ Failed to fetch document list. Status: {response.status_code}")
-                print(f"Response headers: {dict(response.headers)}")
-                print(f"Response body: {response.text}")
-                print(f"Request URL: {response.url}")
+                print(f"❌ Error fetching documents: {response.status_code}")
+                print(f"Response: {response.text}")
+                break
                 
-                # Refresh token and retry once
-                tokens = refresh_if_needed(tokens)
-                if tokens:
-                    headers = get_shoeboxed_headers(tokens['access_token'])
-                    response = requests.get(list_url, headers=headers, params=params)
-                    if response.status_code == 200:
-                        print("✅ Request succeeded after token refresh")
-                    else:
-                        print(f"❌ Request still failed after token refresh: {response.status_code}")
-                        break
-                else:
-                    print("❌ Token refresh failed")
-                    break
-            
+            # Parse response
             data = response.json()
-            doc_list = data.get('documents', [])
+            documents = data.get('documents', [])
             
-            if not doc_list:
-                print("No more documents found in this batch")
+            if not documents:
                 break
-            
-            print(f"\n📄 Found {len(doc_list)} documents in current batch")
-            
-            # Process and filter documents
-            batch_stats = {
-                'total': 0,
-                'to_process': 0,
-                'already_processed': 0,
-                'types': {}
-            }
-            
-            for doc in doc_list:
-                doc_id = doc.get('id')
-                doc_type = doc.get('type', 'unknown')
                 
-                if not doc_id:
-                    print(f"⚠️ Document without ID found: {doc}")
-                    continue
-                
-                batch_stats['total'] += 1
-                batch_stats['types'][doc_type] = batch_stats['types'].get(doc_type, 0) + 1
-                
-                if doc_id in checkpoint.processed_docs:
-                    batch_stats['already_processed'] += 1
-                    continue
-                
-                batch_stats['to_process'] += 1
-                all_document_ids.append(doc_id)
+            # Filter out already processed documents
+            new_doc_ids = [
+                doc['id'] for doc in documents 
+                if checkpoint.should_process_doc(doc['id'])
+            ]
+            all_document_ids.extend(new_doc_ids)
             
-            # Update total count and display
-            total_to_process = len(all_document_ids)
-            running_count.metric("Documents To Process", total_to_process)
+            # Update progress
+            print(f"📡 Fetching document batch starting at offset {offset}")
+            print(f"Found {len(documents)} documents, {len(new_doc_ids)} new to process")
+            print(f"Running total: {len(all_document_ids)} documents to process")
             
-            # Log batch statistics
-            print(f"\n📊 Batch Statistics:")
-            print(f"   Total Documents: {batch_stats['total']}")
-            print(f"   Already Processed: {batch_stats['already_processed']}")
-            print(f"   To Process: {batch_stats['to_process']}")
-            print(f"   Document Types Found:")
-            for doc_type, count in batch_stats['types'].items():
-                print(f"      - {doc_type}: {count}")
-            print(f"   Running Total To Process: {total_to_process}")
-            
-            # Update offset and check if we've retrieved all documents
-            current_offset += len(doc_list)  # Use actual number of documents received
-            if current_offset >= total_count:
-                print(f"Reached total count ({total_count}), stopping retrieval")
+            # Break if we've received fewer documents than the limit
+            if len(documents) < limit:
                 break
+                
+            offset += limit
             
-            time.sleep(0.5)  # Be nice to the API
-    
+        print(f"\n📊 Found {len(all_document_ids)} documents to process")
+        return all_document_ids
+        
     except Exception as e:
-        print(f"❌ Error retrieving document IDs: {str(e)}")
-        print(traceback.format_exc())
-    
-    print(f"\n📊 Final Statistics:")
-    print(f"   Total Documents Found: {total_count}")
-    print(f"   Already in Pinecone: {len(checkpoint.processed_docs)}")
-    print(f"   Failed Previously: {len(checkpoint.failed_docs)}")
-    print(f"   Skipped: {len(checkpoint.skipped_docs)}")
-    print(f"   To Be Processed: {total_to_process}")
-    
-    return all_document_ids
+        print(f"❌ Error in document processing: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return []
 
 def get_shoeboxed_headers(access_token=None):
     """Generate headers for Shoeboxed API requests"""
@@ -1059,11 +971,17 @@ def split_large_document(document_content, chunk_size=500_000):
 
 class ProcessingCheckpoint:
     def __init__(self):
-        self.checkpoint_file = 'processing_checkpoint.json'
+        self.checkpoint_file = 'processing_checkpoint.json'  # Restore this line
+        self.processed_count = 0
+        self.processed_documents = set()
+        self.failed_documents = set()
+        self.skipped_documents = set()
         self.current_batch = 0
-        self.processed_docs = set()
-        self.failed_docs = set()
-        self.skipped_docs = set()
+        self.total_documents = 0
+        self.start_time = time.time()
+        self.processing_times = []
+        self.batch_times = []
+        self.pause_start = None
         self.failure_reasons = {}  # Track why each document failed
         self.retry_counts = {}     # Track retry attempts per document
         self.last_processed_time = None
@@ -1076,33 +994,44 @@ class ProcessingCheckpoint:
                 with open(self.checkpoint_file, 'r') as f:
                     data = json.load(f)
                     self.current_batch = data.get('current_batch', 0)
-                    self.processed_docs = set(data.get('processed_docs', []))
-                    self.failed_docs = set(data.get('failed_docs', []))
-                    self.skipped_docs = set(data.get('skipped_docs', []))
+                    # Handle both old and new key names for backward compatibility
+                    self.processed_documents = set(
+                        data.get('processed_documents', []) or 
+                        data.get('processed_docs', [])
+                    )
+                    self.failed_documents = set(
+                        data.get('failed_documents', []) or 
+                        data.get('failed_docs', [])
+                    )
+                    self.skipped_documents = set(
+                        data.get('skipped_documents', []) or 
+                        data.get('skipped_docs', [])
+                    )
                     self.failure_reasons = data.get('failure_reasons', {})
                     self.retry_counts = data.get('retry_counts', {})
                     self.last_processed_time = data.get('last_processed_time')
                 print(f"📥 Loaded checkpoint: Batch {self.current_batch}")
-                print(f"✅ Processed: {len(self.processed_docs)} documents")
-                print(f"❌ Failed: {len(self.failed_docs)} documents")
-                print(f"⏭️ Skipped: {len(self.skipped_docs)} documents")
-                if self.failed_docs:
+                print(f"✅ Processed: {len(self.processed_documents)} documents")
+                print(f"❌ Failed: {len(self.failed_documents)} documents")
+                print(f"⏭️ Skipped: {len(self.skipped_documents)} documents")
+                if self.failed_documents:
                     print("\n❌ Failed Documents and Reasons:")
-                    for doc_id in self.failed_docs:
+                    for doc_id in self.failed_documents:
                         reason = self.failure_reasons.get(doc_id, "Unknown reason")
                         retries = self.retry_counts.get(doc_id, 0)
                         print(f"   {doc_id}: {reason} (Retries: {retries})")
         except Exception as e:
             print(f"⚠️ Error loading checkpoint: {str(e)}")
+            print(traceback.format_exc())
     
     def save_checkpoint(self):
         """Save current progress to checkpoint file"""
         try:
             data = {
                 'current_batch': self.current_batch,
-                'processed_docs': list(self.processed_docs),
-                'failed_docs': list(self.failed_docs),
-                'skipped_docs': list(self.skipped_docs),
+                'processed_documents': list(self.processed_documents),
+                'failed_documents': list(self.failed_documents),
+                'skipped_documents': list(self.skipped_documents),
                 'failure_reasons': self.failure_reasons,
                 'retry_counts': self.retry_counts,
                 'last_processed_time': datetime.now().isoformat()
@@ -1115,16 +1044,16 @@ class ProcessingCheckpoint:
     
     def mark_processed(self, doc_id):
         """Mark a document as processed"""
-        self.processed_docs.add(doc_id)
-        if doc_id in self.failed_docs:
-            self.failed_docs.remove(doc_id)
+        self.processed_documents.add(doc_id)
+        if doc_id in self.failed_documents:
+            self.failed_documents.remove(doc_id)
             self.failure_reasons.pop(doc_id, None)
         self.retry_counts.pop(doc_id, None)  # Clear retry count on success
         self.save_checkpoint()
     
     def mark_failed(self, doc_id, reason="Unknown error"):
         """Mark a document as failed with a reason"""
-        self.failed_docs.add(doc_id)
+        self.failed_documents.add(doc_id)
         self.failure_reasons[doc_id] = reason
         # Increment retry count
         self.retry_counts[doc_id] = self.retry_counts.get(doc_id, 0) + 1
@@ -1136,7 +1065,7 @@ class ProcessingCheckpoint:
     
     def should_retry(self, doc_id, max_retries=3):
         """Check if a document should be retried based on error category and retry count"""
-        if doc_id not in self.failed_docs:
+        if doc_id not in self.failed_documents:
             return True
             
         error_message = self.failure_reasons.get(doc_id, "Unknown error")
@@ -1156,7 +1085,7 @@ class ProcessingCheckpoint:
     
     def mark_skipped(self, doc_id):
         """Mark a document as skipped"""
-        self.skipped_docs.add(doc_id)
+        self.skipped_documents.add(doc_id)
         self.save_checkpoint()
     
     def update_batch(self, batch_num):
@@ -1167,8 +1096,23 @@ class ProcessingCheckpoint:
     def should_process_doc(self, doc_id):
         """Check if document should be processed"""
         # Only skip if successfully processed or explicitly skipped
-        return doc_id not in self.processed_docs and \
-               doc_id not in self.skipped_docs
+        return doc_id not in self.processed_documents and \
+               doc_id not in self.skipped_documents
+
+    @property
+    def processed(self):
+        return len(self.processed_documents)
+
+    @property
+    def failed(self):
+        return len(self.failed_documents)
+
+    @property
+    def skipped(self):
+        return len(self.skipped_documents)
+
+    def update_processed_count(self):
+        self.processed_count = len(self.processed_documents)  # Keep processed_count in sync
 
 class ProcessingStats:
     def __init__(self):
@@ -1294,9 +1238,9 @@ def process_documents():
             st.session_state.processor = DocumentProcessor()
         
         # Get initial counts from checkpoint
-        processed_count = len(checkpoint.processed_docs)
-        failed_count = len(checkpoint.failed_docs)
-        skipped_count = len(checkpoint.skipped_docs)
+        processed_count = len(checkpoint.processed_documents)
+        failed_count = len(checkpoint.failed_documents)
+        skipped_count = len(checkpoint.skipped_documents)
         
         # Retrieve document IDs
         print("\n🔍 DEBUG: Retrieving document IDs...", flush=True)
@@ -1395,8 +1339,8 @@ def process_documents():
             checkpoint.save_checkpoint()
             
             # Update metrics after batch processing
-            current_processed = len(checkpoint.processed_docs)
-            current_failed = len(checkpoint.failed_docs)
+            current_processed = len(checkpoint.processed_documents)
+            current_failed = len(checkpoint.failed_documents)
             remaining = total_documents - (current_processed - processed_count)
             
             total_metric.metric(
@@ -2225,14 +2169,14 @@ def main():
             st.title("Shoeboxed Document Processor")
             # Display processing statistics in the main area
             col1, col2, col3 = st.columns(3)
-            col1.metric("✅ Previously Processed", len(checkpoint.processed_docs))
-            col2.metric("❌ Failed Documents", len(checkpoint.failed_docs))
-            col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_docs))
+            col1.metric("✅ Previously Processed", len(checkpoint.processed_documents))
+            col2.metric("❌ Failed Documents", len(checkpoint.failed_documents))
+            col3.metric("⏭️ Skipped Documents", len(checkpoint.skipped_documents))
             
             # Show failed document details in an expander if there are any
-            if checkpoint.failed_docs:
+            if checkpoint.failed_documents:
                 with st.expander("Failed Documents Details"):
-                    for doc_id in checkpoint.failed_docs:
+                    for doc_id in checkpoint.failed_documents:
                         reason = checkpoint.failure_reasons.get(doc_id, "Unknown reason")
                         retries = checkpoint.retry_counts.get(doc_id, 0)
                         st.text(f"Document {doc_id}:")
@@ -2714,11 +2658,11 @@ def should_retry_error(error_category, retry_count):
     return retry_count < max_retries.get(error_category, 3)
 
 class ProcessingResult:
-    def __init__(self, doc_id, success, processing_time, error=None):
+    def __init__(self, doc_id, success, time_taken, error_msg=None):
         self.doc_id = doc_id
         self.success = success
-        self.processing_time = processing_time
-        self.error = error
+        self.processing_time = time_taken
+        self.error = error_msg
 
 class DocumentProcessor:
     def __init__(self):
@@ -2729,176 +2673,109 @@ class DocumentProcessor:
         self.checkpoint = ProcessingCheckpoint()
         self.metrics = ProcessingMetrics()
         
-    def process_document_worker(self):
+    def process_document_worker(self, doc):
         """Worker thread for processing documents"""
-        while not self.stop_event.is_set():
-            try:
-                # Check for pause state
-                if st.session_state.get('paused', False):
-                    self.metrics.pause()
-                    time.sleep(1)
-                    continue
-                else:
-                    self.metrics.resume()
-                
-                try:
-                    doc = self.processing_queue.get_nowait()
-                    if not isinstance(doc, dict) or 'id' not in doc:
-                        print(f"⚠️ Invalid document format: {doc}")
-                        continue
-                except queue.Empty:
-                    break
-                
-                start_time = time.time()
-                try:
-                    # Load fresh tokens for each document
-                    current_tokens = load_tokens()
-                    if not current_tokens:
-                        raise Exception("Failed to load tokens")
-                    
-                    success = process_single_document(doc, current_tokens, self.checkpoint)
-                    processing_time = time.time() - start_time
-                    
-                    with self.lock:
-                        if success:
-                            self.metrics.processed_count += 1
-                        else:
-                            self.metrics.failed_count += 1
-                        self.metrics.add_processing_time(processing_time)
-                    
-                    self.results_queue.put(ProcessingResult(
-                        doc_id=doc['id'],
-                        success=success,
-                        processing_time=processing_time
-                    ))
-                
-                except Exception as e:
-                    error_msg = f"Error processing document {doc.get('id', 'Unknown')}: {str(e)}"
-                    print(f"❌ {error_msg}")
-                    
-                    with self.lock:
-                        self.metrics.failed_count += 1
-                        self.metrics.add_processing_time(time.time() - start_time)
-                    
-                    self.results_queue.put(ProcessingResult(
-                        doc_id=doc.get('id', 'Unknown'),
-                        success=False,
-                        processing_time=time.time() - start_time,
-                        error=str(e)
-                    ))
-                
-                time.sleep(RATE_LIMIT_DELAY)
-                
-            except Exception as e:
-                print(f"Error in worker thread: {str(e)}")
-                print(traceback.format_exc())
-                continue
+        start_time = time.time()
+        try:
+            # Process document
+            success = process_single_document(doc, load_tokens(), self.checkpoint)
+            processing_time = time.time() - start_time
+            
+            if success:
+                self.metrics.processed_count += 1
+                self.metrics.add_processing_time(processing_time)
+                return ProcessingResult(
+                    doc.get('id', 'unknown'),
+                    True,
+                    processing_time
+                )
+            return None
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            print(f"❌ Error processing document: {str(e)}")
+            self.metrics.failed_count += 1
+            self.metrics.add_processing_time(processing_time)
+            return ProcessingResult(
+                doc.get('id', 'unknown'),
+                False,
+                processing_time,
+                str(e)
+            )
 
     def process_batch(self, documents, progress_bar, status_text, metrics_cols, processing_details, recent_files):
-        """Process a batch of documents with real-time progress updates"""
+        """Process a batch of documents with progress tracking"""
         try:
-            batch_start_time = time.time()
+            # Process documents and update progress
+            for doc in documents:
+                # Process document and update metrics
+                result = self.process_document_worker(doc)
+                if result:
+                    # Update progress display
+                    progress_text = f"Processing documents... {self.metrics.processed_count} processed, {self.metrics.failed_count} failed"
+                    status_text.text(progress_text)
+                    
+                    # Update metrics display
+                    self._update_metrics_display(self.metrics)
+                    
+                    # Update recent files display
+                    if recent_files is not None:
+                        recent_files.markdown(f"Recently processed: {doc.get('id', 'Unknown ID')}")
             
-            # Initialize processing queue if empty
-            if self.processing_queue.empty():
-                for doc in documents:
-                    self.processing_queue.put(doc)
-                self.metrics.total_documents = len(self.checkpoint.processed_docs) + len(documents)
+            # Save checkpoint after batch
+            self.checkpoint.save_checkpoint()
+            print(f"💾 Saved checkpoint at batch {self.checkpoint.current_batch}")
             
-            # Create and start worker threads
-            num_threads = min(MAX_THREADS, len(documents))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = []
-                for _ in range(num_threads):
-                    futures.append(executor.submit(self.process_document_worker))
-                
-                # Monitor progress while threads are running
-                while any(not f.done() for f in futures):
-                    try:
-                        # Process results and update UI
-                        self._process_results(progress_bar, status_text, metrics_cols, processing_details)
-                        
-                        # Get current progress stats
-                        stats = self.metrics.get_progress_stats()
-                        completion_estimate = stats["estimated_completion"]
-                        
-                        # Update status message
-                        if st.session_state.get('paused', False):
-                            status_text.text("⏸️ Processing paused... Click Resume to continue")
-                        else:
-                            rate = stats["processing_rate"]["docs_per_minute"]
-                            status_text.text(
-                                f"🔄 Progress: {stats['progress_percentage']:.1f}% | "
-                                f"Rate: {rate:.1f} docs/min | "
-                                f"Est. remaining: {completion_estimate['time_remaining']} "
-                                f"(Accuracy: {completion_estimate['accuracy']})"
-                            )
-                        
-                        time.sleep(0.1)
-                    except Exception as e:
-                        print(f"Error in progress monitoring: {str(e)}")
-                        continue
-                
-                # Process any remaining results
-                self._process_results(progress_bar, status_text, metrics_cols, processing_details)
-                
-                # Wait for all workers to complete
-                concurrent.futures.wait(futures)
-                
-                # Record batch processing time
-                self.metrics.add_batch_time(time.time() - batch_start_time)
-                
         except Exception as e:
             print(f"Error in process_batch: {str(e)}")
-            print(traceback.format_exc())
-    
+            raise
+
     def _process_results(self, progress_bar, status_text, metrics_cols, processing_details):
-        """Process results from the results queue and update UI"""
+        """Process and display results of document processing"""
         try:
-            while True:
-                try:
-                    result = self.results_queue.get_nowait()
-                except queue.Empty:
-                    break
-                
-                # Get current progress stats
-                stats = self.metrics.get_progress_stats()
-                
-                # Update progress bar
-                progress_bar.progress(stats["progress_percentage"] / 100)
-                
-                # Update metrics
-                metrics_cols[0].metric(
-                    "Total Documents",
-                    f"{stats['total_documents']:,}",
-                    f"{stats['remaining']:,} remaining"
-                )
-                metrics_cols[1].metric(
-                    "Processed",
-                    f"{stats['processed']:,}",
-                    f"+{stats['processed'] - self.checkpoint.processed_count}" if stats['processed'] > self.checkpoint.processed_count else None
-                )
-                metrics_cols[2].metric(
-                    "Failed",
-                    f"{stats['failed']:,}",
-                    f"+{stats['failed'] - len(self.checkpoint.failed_docs)}" if stats['failed'] > len(self.checkpoint.failed_docs) else None
-                )
-                
-                # Log processing details
-                if result.success:
-                    processing_details.info(
-                        f"✅ Processed document {result.doc_id} ({result.processing_time:.1f}s) | "
-                        f"Rate: {stats['processing_rate']['docs_per_minute']:.1f} docs/min"
-                    )
-                else:
-                    processing_details.error(
-                        f"❌ Failed document {result.doc_id}: {result.error} "
-                        f"({result.processing_time:.1f}s)"
-                    )
-                
+            # Update progress display
+            progress_text = f"Processing documents... {self.metrics.processed_count} processed, {self.metrics.failed_count} failed"
+            status_text.text(progress_text)
+            
+            # Update metrics display
+            self._update_metrics_display(self.metrics)
+            
         except Exception as e:
-            print(f"Error processing results: {str(e)}")
-            print(traceback.format_exc())
+            print(f"Error in progress monitoring: {str(e)}")
+
+    def _update_metrics_display(self, stats):
+        """Update the metrics display with current processing statistics."""
+        if not hasattr(self, 'metrics_container'):
+            return
+            
+        total_remaining = self.metrics.total_documents - stats['processed']
+        
+        # Update metrics
+        col1, col2, col3 = self.metrics_container.columns(3)
+        
+        col1.metric(
+            "Total Documents",
+            f"{self.metrics.total_documents:,}",
+            None
+        )
+        
+        col2.metric(
+            "Remaining",
+            f"{total_remaining:,}",
+            f"-{stats['processed']}" if stats['processed'] > 0 else None,
+            delta_color="inverse"
+        )
+        
+        col3.metric(
+            "Processed",
+            f"{stats['processed']:,}",
+            f"+{stats['processed'] - len(self.checkpoint.processed_documents)}" if stats['processed'] > len(self.checkpoint.processed_documents) else None
+        )
+        
+        # Update progress bar if it exists
+        if hasattr(self, 'progress_bar'):
+            progress = (stats['processed'] / self.metrics.total_documents) * 100
+            self.progress_bar.progress(min(progress, 100))
 
 def chunk_document(text, metadata, max_chunk_size=1000):
     """

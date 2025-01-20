@@ -569,66 +569,52 @@ def extract_text_from_pdf(doc, access_token):
 class ProcessingState:
     """Class to manage processing state"""
     def __init__(self):
-        self.progress_file = 'processing_progress.json'
-        self.processed_docs = set()
-        self.failed_docs = {}
-        self.skipped_docs = set()
-        self.status = 'initialized'
-    
-    def load_progress(self):
-        """Load progress from file"""
+        self.processed_documents = set()
+        self.failed_documents = set()
+        self.skipped_documents = set()
+        self.current_batch = 0
+        self.failure_reasons = {}
+        self.retry_counts = {}
+        self.last_processed_time = None
+        self.load_state()
+
+    def load_state(self):
         try:
-            if os.path.exists(self.progress_file):
-                with open(self.progress_file, 'r') as f:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
                     data = json.load(f)
-                    self.processed_docs = set(data.get('processed_docs', []))
-                    self.failed_docs = data.get('failed_docs', {})
-                    self.skipped_docs = set(data.get('skipped_docs', []))
-                    self.status = data.get('status', 'initialized')
+                    self.processed_documents = set(data.get('processed_docs', []))
+                    self.failed_documents = set(data.get('failed_docs', []))
+                    self.skipped_documents = set(data.get('skipped_docs', []))
+                    self.current_batch = data.get('current_batch', 0)
+                    self.failure_reasons = data.get('failure_reasons', {})
+                    self.retry_counts = data.get('retry_counts', {})
+                    self.last_processed_time = data.get('last_processed_time')
         except Exception as e:
-            print(f"Error loading progress: {str(e)}")
-    
-    def save_progress(self):
-        """Save progress to file"""
+            print(f"Error loading state: {str(e)}")
+
+    def save_state(self):
         try:
-            with open(self.progress_file, 'w') as f:
-                json.dump({
-                    'processed_docs': list(self.processed_docs),
-                    'failed_docs': self.failed_docs,
-                    'skipped_docs': list(self.skipped_docs),
-                    'status': self.status
-                }, f)
+            data = {
+                'processed_docs': list(self.processed_documents),
+                'failed_docs': list(self.failed_documents),
+                'skipped_docs': list(self.skipped_documents),
+                'current_batch': self.current_batch,
+                'failure_reasons': self.failure_reasons,
+                'retry_counts': self.retry_counts,
+                'last_processed_time': datetime.now().isoformat()
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f)
         except Exception as e:
-            print(f"Error saving progress: {str(e)}")
-    
+            print(f"Error saving state: {str(e)}")
+
     def mark_processed(self, doc_id):
-        """Mark document as processed"""
-        self.processed_docs.add(doc_id)
-        if doc_id in self.failed_docs:
-            del self.failed_docs[doc_id]
-        self.save_progress()
-    
-    def mark_failed(self, doc_id, reason):
-        """Mark document as failed with reason"""
-        self.failed_docs[doc_id] = {
-            'reason': reason,
-            'timestamp': datetime.now().isoformat()
-        }
-        self.save_progress()
-    
-    def mark_skipped(self, doc_id):
-        """Mark document as skipped"""
-        self.skipped_docs.add(doc_id)
-        self.save_progress()
-    
+        self.processed_documents.add(doc_id)
+        self.save_state()
+
     def is_processed(self, doc_id):
-        """Check if document is already processed"""
-        return doc_id in self.processed_docs
-    
-    def set_status(self, status):
-        """Set processing status"""
-        self.status = status
-        self.save_progress()
+        return doc_id in self.processed_documents
 
 def init_pinecone():
     """Initialize Pinecone with proper configuration"""
@@ -1478,7 +1464,7 @@ def main():
     
     # Process documents one at a time
     total = len(documents)
-    processed_count = len(state.processed_docs)
+    processed_count = len(state.processed_documents)
     remaining = total - processed_count
     
     print(f"\nDocument Processing Status:")
@@ -1496,7 +1482,7 @@ def main():
         state.set_status('processing')
     
     # Create a list of documents to process (excluding already processed ones)
-    documents_to_process = [doc for doc in documents if doc['id'] not in state.processed_docs]
+    documents_to_process = [doc for doc in documents if doc['id'] not in state.processed_documents]
     print(f"\nFiltered down to {len(documents_to_process)} documents to process")
     
     with tqdm(total=total, initial=processed_count, desc="Processing documents") as pbar:
@@ -1517,7 +1503,7 @@ def main():
         state.set_status('completed')
         print("\nProcessing complete!")
     
-    final_processed = len(state.processed_docs)
+    final_processed = len(state.processed_documents)
     print(f"\nProcessing Summary:")
     print(f"Total documents: {total}")
     print(f"Successfully processed: {final_processed}")
